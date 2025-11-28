@@ -1,10 +1,9 @@
 import logging
 import json
-import re
 
 import torch
 from pathlib import Path
-from unicodedata import category
+from unicodedata import category, normalize
 from tokenizers import Tokenizer
 from huggingface_hub import hf_hub_download
 
@@ -33,7 +32,7 @@ class EnTokenizer:
         text_tokens = torch.IntTensor(text_tokens).unsqueeze(0)
         return text_tokens
 
-    def encode( self, txt: str, verbose=False):
+    def encode(self, txt: str):
         """
         clean_text > (append `lang_id`) > replace SPACE > encode text using Tokenizer
         """
@@ -46,8 +45,7 @@ class EnTokenizer:
         if isinstance(seq, torch.Tensor):
             seq = seq.cpu().numpy()
 
-        txt: str = self.tokenizer.decode(seq,
-        skip_special_tokens=False)
+        txt: str = self.tokenizer.decode(seq, skip_special_tokens=False)
         txt = txt.replace(' ', '')
         txt = txt.replace(SPACE, ' ')
         txt = txt.replace(EOT, '')
@@ -61,6 +59,7 @@ REPO_ID = "ResembleAI/chatterbox"
 # Global instances for optional dependencies
 _kakasi = None
 _dicta = None
+_russian_stresser = None
 
 
 def is_kanji(c: str) -> bool:
@@ -155,6 +154,52 @@ def korean_normalize(text: str) -> str:
     return result.strip()
 
 
+FRENCH_DECOMPOSE_MAP = {
+    # Lowercase
+    "à": "a\u0300",  # a grave
+    "â": "a\u0302",  # a circumflex
+    "ä": "a\u0308",  # a diaeresis
+    "é": "e\u0301",  # e acute
+    "è": "e\u0300",  # e grave
+    "ê": "e\u0302",  # e circumflex
+    "ë": "e\u0308",  # e diaeresis
+    "ï": "i\u0308",  # i diaeresis
+    "î": "i\u0302",  # i circumflex
+    "ô": "o\u0302",  # o circumflex
+    "ö": "o\u0308",  # o diaeresis
+    "ù": "u\u0300",  # u grave
+    "û": "u\u0302",  # u circumflex
+    "ü": "u\u0308",  # u diaeresis
+    "ç": "c\u0327",  # c cedilla
+    "ÿ": "y\u0308",  # y diaeresis (less common)
+    # Uppercase
+    "À": "A\u0300",
+    "Â": "A\u0302",
+    "Ä": "A\u0308",
+    "É": "E\u0301",
+    "È": "E\u0300",
+    "Ê": "E\u0302",
+    "Ë": "E\u0308",
+    "Ï": "I\u0308",
+    "Î": "I\u0302",
+    "Ô": "O\u0302",
+    "Ö": "O\u0308",
+    "Ù": "U\u0300",
+    "Û": "U\u0302",
+    "Ü": "U\u0308",
+    "Ç": "C\u0327",
+    "Ÿ": "Y\u0308",
+    # Ligatures (optional: map to plain letters for simpler pronunciation; adjust if TTS handles them well)
+    "œ": "oe",
+    "Œ": "OE",
+}
+
+
+def decompose_french_text(text): # Author: Diggy
+    """Replace all French special letters with decomposed forms"""
+    return "".join(FRENCH_DECOMPOSE_MAP.get(char, char) for char in text)
+
+
 class ChineseCangjieConverter:
     """Converts Chinese characters to Cangjie codes for tokenization."""
     
@@ -191,7 +236,7 @@ class ChineseCangjieConverter:
     def _init_segmenter(self):
         """Initialize pkuseg segmenter."""
         try:
-            from pkuseg import pkuseg
+            from spacy_pkuseg import pkuseg
             self.segmenter = pkuseg()
         except ImportError:
             logger.warning("pkuseg not available - Chinese segmentation will be skipped")
@@ -235,6 +280,25 @@ class ChineseCangjieConverter:
         return "".join(output)
 
 
+def add_russian_stress(text: str) -> str:
+    """Russian text normalization: adds stress marks to Russian text."""
+    global _russian_stresser
+    
+    try:
+        if _russian_stresser is None:
+            from russian_text_stresser.text_stresser import RussianTextStresser
+            _russian_stresser = RussianTextStresser()
+        
+        return _russian_stresser.stress_text(text)
+        
+    except ImportError:
+        logger.warning("russian_text_stresser not available - Russian stress labeling skipped")
+        return text
+    except Exception as e:
+        logger.warning(f"Russian stress labeling failed: {e}")
+        return text
+
+
 class MTLTokenizer:
     def __init__(self, vocab_file_path):
         self.tokenizer: Tokenizer = Tokenizer.from_file(vocab_file_path)
@@ -247,12 +311,26 @@ class MTLTokenizer:
         assert SOT in voc
         assert EOT in voc
 
-    def text_to_tokens(self, text: str, language_id: str = None):
-        text_tokens = self.encode(text, language_id=language_id)
+    def preprocess_text(self, raw_text: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
+        """
+        Text preprocessor that handles lowercase conversion and NFKD normalization.
+        """
+        preprocessed_text = raw_text
+        if lowercase:
+            preprocessed_text = preprocessed_text.lower()
+        if nfkd_normalize:
+            preprocessed_text = normalize("NFKD", preprocessed_text)
+        
+        return preprocessed_text
+
+    def text_to_tokens(self, text: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
+        text_tokens = self.encode(text, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
         text_tokens = torch.IntTensor(text_tokens).unsqueeze(0)
         return text_tokens
 
-    def encode(self, txt: str, language_id: str = None):
+    def encode(self, txt: str, language_id: str = None, lowercase: bool = True, nfkd_normalize: bool = True):
+        txt = self.preprocess_text(txt, language_id=language_id, lowercase=lowercase, nfkd_normalize=nfkd_normalize)
+        
         # Language-specific text processing
         if language_id == 'zh':
             txt = self.cangjie_converter(txt)
@@ -262,6 +340,10 @@ class MTLTokenizer:
             txt = add_hebrew_diacritics(txt)
         elif language_id == 'ko':
             txt = korean_normalize(txt)
+        elif language_id == 'fr': # Author: Rouxin  
+            txt = decompose_french_text(txt)
+        elif language_id == 'ru':
+            txt = add_russian_stress(txt)
         
         # Prepend language token
         if language_id:

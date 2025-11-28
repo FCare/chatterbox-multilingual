@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import librosa
 import torch
@@ -201,20 +202,26 @@ class ChatterboxTTS:
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=ve_embed.dtype),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
     def generate(
         self,
         text,
-        repetition_penalty=1.2,
-        min_p=0.05,
-        top_p=1.0,
+        language_id=None, # for API compatibility; not used in this model
         audio_prompt_path=None,
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
+        # cache optimization params
+        max_new_tokens=1000, 
+        max_cache_len=1500, # Affects the T3 speed, hence important
+        # t3 sampling params
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        t3_params={},
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -227,7 +234,7 @@ class ChatterboxTTS:
             self.conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
             ).to(device=self.device)
 
         # Norm and tokenize text
@@ -246,27 +253,48 @@ class ChatterboxTTS:
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=1000,  # TODO: use the value in config
+                max_new_tokens=max_new_tokens,  # TODO: use the value in config
                 temperature=temperature,
                 cfg_weight=cfg_weight,
+                max_cache_len=max_cache_len,
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                **t3_params,
             )
-            # Extract only the conditional batch.
-            speech_tokens = speech_tokens[0]
 
-            # TODO: output becomes 1D
-            speech_tokens = drop_invalid_tokens(speech_tokens)
             
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+            def speech_to_wav(speech_tokens):
+                # Extract only the conditional batch.
+                speech_tokens = speech_tokens[0]
 
-            speech_tokens = speech_tokens.to(self.device)
+                # TODO: output becomes 1D
+                speech_tokens = drop_invalid_tokens(speech_tokens)
+                
+                def drop_bad_tokens(tokens):
+                    # Use torch.where instead of boolean indexing to avoid sync
+                    mask = tokens < 6561
+                    # Count valid tokens without transferring to CPU
+                    valid_count = torch.sum(mask).item()
+                    # Create output tensor of the right size
+                    result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
+                    # Use torch.masked_select which is more CUDA-friendly
+                    result = torch.masked_select(tokens, mask)
+                    return result
 
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
-            )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+                # speech_tokens = speech_tokens[speech_tokens < 6561]
+                speech_tokens = drop_bad_tokens(speech_tokens)
+                import time
+                start = time.time()
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=speech_tokens,
+                    ref_dict=self.conds.gen,
+                )
+                end = time.time()
+                print(f"S3Gen inference time: {end - start:.2f} seconds")
+                wav = wav.squeeze(0).detach().cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+            return speech_to_wav(speech_tokens)
+

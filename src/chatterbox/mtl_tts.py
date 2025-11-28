@@ -168,7 +168,7 @@ class ChatterboxMultilingualTTS:
         ve.to(device).eval()
 
         t3 = T3(T3Config.multilingual())
-        t3_state = load_safetensors(ckpt_dir / "t3_23lang.safetensors")
+        t3_state = load_safetensors(ckpt_dir / "t3_mtl23ls_v2.safetensors")
         if "model" in t3_state.keys():
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
@@ -181,7 +181,7 @@ class ChatterboxMultilingualTTS:
         s3gen.to(device).eval()
 
         tokenizer = MTLTokenizer(
-            str(ckpt_dir / "mtl_tokenizer.json")
+            str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
         )
 
         conds = None
@@ -197,7 +197,7 @@ class ChatterboxMultilingualTTS:
                 repo_id=REPO_ID,
                 repo_type="model",
                 revision="main", 
-                allow_patterns=["ve.pt", "t3_23lang.safetensors", "s3gen.pt", "mtl_tokenizer.json", "conds.pt", "Cangjie5_TC.json"],
+                allow_patterns=["ve.pt", "t3_mtl23ls_v2.safetensors", "s3gen.pt", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"],
                 token=os.getenv("HF_TOKEN"),
             )
         )
@@ -226,7 +226,7 @@ class ChatterboxMultilingualTTS:
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=ve_embed.dtype),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
@@ -238,9 +238,14 @@ class ChatterboxMultilingualTTS:
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
-        repetition_penalty=2.0,
+        # cache optimization params
+        max_new_tokens=1000, 
+        max_cache_len=1500, # Affects the T3 speed, hence important
+        # t3 sampling params
+        repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        t3_params={},
     ):
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
@@ -256,12 +261,12 @@ class ChatterboxMultilingualTTS:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
             _cond: T3Cond = self.conds.t3
             self.conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
             ).to(device=self.device)
 
         # Norm and tokenize text
@@ -278,12 +283,14 @@ class ChatterboxMultilingualTTS:
             speech_tokens = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=1000,  # TODO: use the value in config
+                max_new_tokens=max_new_tokens,  # TODO: use the value in config
                 temperature=temperature,
                 cfg_weight=cfg_weight,
+                max_cache_len=max_cache_len,
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                **t3_params,
             )
             # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
