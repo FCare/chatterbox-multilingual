@@ -91,7 +91,15 @@ def punc_norm(text: str) -> str:
 
     return text
 
-
+@dataclass
+class StreamingMetrics:
+    """Metrics for streaming TTS generation"""
+    latency_to_first_chunk: Optional[float] = None
+    rtf: Optional[float] = None
+    total_generation_time: Optional[float] = None
+    total_audio_duration: Optional[float] = None
+    chunk_count: int = 0
+    
 @dataclass
 class Conditionals:
     """
