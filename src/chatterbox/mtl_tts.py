@@ -137,6 +137,8 @@ class Conditionals:
 
     @classmethod
     def load(cls, fpath, map_location="cpu"):
+        if isinstance(map_location, str):
+            map_location = torch.device(map_location)
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
@@ -172,6 +174,12 @@ class ChatterboxMultilingualTTS:
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxMultilingualTTS':
         ckpt_dir = Path(ckpt_dir)
 
+        # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
+        if device in ["cpu", "mps"]:
+            map_location = torch.device('cpu')
+        else:
+            map_location = None
+
         ve = VoiceEncoder()
         ve.load_state_dict(
             torch.load(ckpt_dir / "ve.pt", weights_only=True)
@@ -197,7 +205,7 @@ class ChatterboxMultilingualTTS:
 
         conds = None
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
-            conds = Conditionals.load(builtin_voice).to(device)
+            conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
         return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
 
@@ -283,8 +291,9 @@ class ChatterboxMultilingualTTS:
         # Norm and tokenize text
         text = punc_norm(text)
         text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
-        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
-
+        if cfg_weight > 0.0:
+        	text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+            
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
@@ -305,10 +314,20 @@ class ChatterboxMultilingualTTS:
             )
             # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
+            def drop_bad_tokens(tokens):
+                # Use torch.where instead of boolean indexing to avoid sync
+                mask = tokens < 6561
+                # Count valid tokens without transferring to CPU
+                valid_count = torch.sum(mask).item()
+                # Create output tensor of the right size
+                result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
+                # Use torch.masked_select which is more CUDA-friendly
+                result = torch.masked_select(tokens, mask)
+                return result
 
             # TODO: output becomes 1D
             speech_tokens = drop_invalid_tokens(speech_tokens)
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+            speech_tokens = drop_bad_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
 
             wav, _ = self.s3gen.inference(
@@ -329,6 +348,7 @@ class ChatterboxMultilingualTTS:
         print_metrics,
         fade_duration=0.02  # seconds to apply linear fade-in on each chunk
     ):
+
         # Combine buffered chunks of tokens
         new_tokens = torch.cat(token_buffer, dim=-1)
 
@@ -347,6 +367,21 @@ class ChatterboxMultilingualTTS:
 
         # Drop any invalid tokens and move to the correct device
         clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
+        def drop_bad_tokens(tokens):
+            # Use torch.where instead of boolean indexing to avoid sync
+            mask = tokens < 6561
+            # Count valid tokens without transferring to CPU
+            valid_count = torch.sum(mask).item()
+            # Create output tensor of the right size
+            result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
+            # Use torch.masked_select which is more CUDA-friendly
+            result = torch.masked_select(tokens, mask)
+            return result
+        clean_tokens = drop_bad_tokens(clean_tokens)
+
+        if len(clean_tokens) == 0:
+            return None, 0.0, False
+        clean_tokens = drop_bad_tokens(clean_tokens)
         if len(clean_tokens) == 0:
             return None, 0.0, False
 
@@ -440,14 +475,13 @@ class ChatterboxMultilingualTTS:
         # Norm and tokenize text
         text = punc_norm(text)
         text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
+        if cfg_weight > 0.0:
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
 
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
-
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
 
         total_audio_length = 0.0
         all_tokens_processed = []  # Keep track of all tokens processed so far
@@ -466,7 +500,6 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
                 **t3_params
             ):
-
                 # Extract only the conditional batch.
                 token_chunk = token_chunk[0]
 
@@ -475,6 +508,7 @@ class ChatterboxMultilingualTTS:
                     [token_chunk], all_tokens_processed, context_window, 
                     start_time, metrics, print_metrics, fade_duration
                 )
+                
                 if success:
                     total_audio_length += audio_duration
                     yield audio_tensor, metrics
