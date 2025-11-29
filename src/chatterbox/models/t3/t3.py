@@ -158,8 +158,6 @@ class T3(nn.Module):
             input_ids=None,
             # position_ids=position_ids, # TODO? ROPE should be fine?
             inputs_embeds=embeds,
-            output_hidden_states=True,
-            return_dict=True,
             use_cache=(not training),
         )
         hidden_states = tfmr_out.hidden_states[-1]  # final tfmr layer output, (B, seq, dim)
@@ -517,7 +515,7 @@ class T3(nn.Module):
 
             # print(kv_cache.get_seq_length().unsqueeze(0))
             torch.compiler.cudagraph_mark_step_begin()
-            bucket_size = 250
+            bucket_size = 500
             max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
             outputs = generate_token(
                 self._speech_embedding_cache,
@@ -568,8 +566,8 @@ class T3(nn.Module):
         # optimizations
         max_cache_len=1500,
         initial_forward_pass_backend="eager",
-        generate_token_backend="cudagraphs-manual",
-        # generate_token_backend="eager",
+        # generate_token_backend="cudagraphs-manual",
+        generate_token_backend="eager",
         stride_length=4,
         skip_when_1=True,
     ) -> Generator[torch.Tensor, None, None]:
@@ -579,7 +577,6 @@ class T3(nn.Module):
         from tqdm import tqdm
         import torch.nn.functional as F
         from transformers.generation.logits_process import TopPLogitsWarper, RepetitionPenaltyLogitsProcessor
-
         # Validate inputs
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
         
@@ -609,7 +606,6 @@ class T3(nn.Module):
 
         # batch_size=2 for CFG
         bos_embed = torch.cat([bos_embed, bos_embed])
-
         # Combine condition and BOS token for the initial input
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
 
@@ -617,7 +613,6 @@ class T3(nn.Module):
         PAD_TOKEN_ID = self.hp.stop_speech_token + 1 # Assuming unused
         bos_len = bos_token.shape[1] # == 1
         chunk_buffer = []
-
         # Instantiate the logits processors.
         self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=skip_when_1)
 
@@ -625,12 +620,10 @@ class T3(nn.Module):
         inputs_embeds = inputs_embeds.to(self.patched_model.dtype)
         embeds = embeds.to(self.patched_model.dtype)
         bos_embed = bos_embed.to(self.patched_model.dtype)
-
         stop_token_tensor = torch.tensor(self.hp.stop_speech_token, device=self.device)
         
         # Fix: Set max_batch_size based on CFG usage
         effective_batch_size = 2 if cfg_weight > 0.0 else 1
-
         _, seq_len = inputs_embeds.shape[:2]
         if max_cache_len < seq_len + max_new_tokens:
             print(f"Warning: max_cache_len {max_cache_len} is too small for seq_len {seq_len} and max_new_tokens {max_new_tokens}")
@@ -682,8 +675,7 @@ class T3(nn.Module):
             seq_len=seq_len,
             patched_model=self.patched_model
         ).clone()  # Clone to avoid in-place modification issues
-
-
+        #Je vais louper le premier batch si je ne l'ajoute pas....
         indices = torch.arange(1, max_new_tokens + 1, device=generated_ids.device)
         batch_idx = torch.zeros(1, dtype=torch.long, device=generated_ids.device)
         if generate_token_backend == "cudagraphs-manual":
@@ -699,25 +691,15 @@ class T3(nn.Module):
             self.cudagraph_wrapper.guard()
 
             _generate_token_variants["cudagraphs-manual"] = self.cudagraph_wrapper
-
         generate_token = _generate_token_variants.get(generate_token_backend, _generate_token_variants["eager"])
         stride_length = stride_length if "stride" in generate_token_backend else 1
-        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
+  
+        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
             i_tensor = indices[i * stride_length]
-            # Check for EOS token.
-            if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
-                if (generated_ids == stop_token_tensor).any():
-                    yield torch.cat(chunk_buffer, dim=1)
-                    break
-	    # Yield chunk when buffer is full
-        if len(chunk_buffer) >= chunk_size:
-            yield torch.cat(chunk_buffer, dim=1)
-            chunk_buffer = []
-
+            bucket_size = 500
+            max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
             # print(kv_cache.get_seq_length().unsqueeze(0))
             torch.compiler.cudagraph_mark_step_begin()
-            bucket_size = 250
-            max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
             outputs = generate_token(
                 self._speech_embedding_cache,
                 output_logits,
@@ -740,9 +722,24 @@ class T3(nn.Module):
             if len(outputs) == 3:
                 generated_ids = outputs[2].clone()
                 chunk_buffer.append(generated_ids)
-            output_logits = output_logits.clone()
+            else:
+                if len(outputs) >= 1:
+                    token_ids = outputs[0]
+                    chunk_buffer.append(token_ids)
+            
+            # Check for EOS token.
+            if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
+                if outputs[0].flatten().eq(stop_token_tensor).any():
+                    if chunk_buffer:
+                        yield torch.cat(chunk_buffer, dim=1)
+                    break
+                
+            # Yield chunk when buffer is full
+            if len(chunk_buffer) >= chunk_size:
+                yield torch.cat(chunk_buffer, dim=1)
+                chunk_buffer = []
 
-        #yield torch.cat(chunk_buffer, dim=1)
+            output_logits = output_logits.clone()
 
 def _initial_forward_pass(
     inputs_embeds: Tensor,

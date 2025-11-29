@@ -4,6 +4,7 @@ import time
 from typing import Generator, Tuple, Optional
 
 import librosa
+import numpy as np
 import torch
 import perth
 import torch.nn.functional as F
@@ -133,7 +134,7 @@ class ChatterboxTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+        # self.watermarker = perth.PerthImplicitWatermarker()
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
@@ -302,8 +303,8 @@ class ChatterboxTTS:
                 end = time.time()
                 print(f"S3Gen inference time: {end - start:.2f} seconds")
                 wav = wav.squeeze(0).detach().cpu().numpy()
-                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-                return torch.from_numpy(watermarked_wav).unsqueeze(0)
+                #watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                return torch.from_numpy(wav).unsqueeze(0)
 
             return speech_to_wav(speech_tokens)
 
@@ -317,16 +318,6 @@ class ChatterboxTTS:
         print_metrics,
         fade_duration=0.02  # seconds to apply linear fade-in on each chunk
     ):
-        def drop_bad_tokens(tokens):
-                # Use torch.where instead of boolean indexing to avoid sync
-                mask = tokens < 6561
-                # Count valid tokens without transferring to CPU
-                valid_count = torch.sum(mask).item()
-                # Create output tensor of the right size
-                result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
-                # Use torch.masked_select which is more CUDA-friendly
-                result = torch.masked_select(tokens, mask)
-                return result
 
         # Combine buffered chunks of tokens
         new_tokens = torch.cat(token_buffer, dim=-1)
@@ -346,6 +337,18 @@ class ChatterboxTTS:
 
         # Drop any invalid tokens and move to the correct device
         clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
+        def drop_bad_tokens(tokens):
+            # Use torch.where instead of boolean indexing to avoid sync
+            mask = tokens < 6561
+            # Count valid tokens without transferring to CPU
+            valid_count = torch.sum(mask).item()
+            # Create output tensor of the right size
+            result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
+            # Use torch.masked_select which is more CUDA-friendly
+            result = torch.masked_select(tokens, mask)
+            return result
+        clean_tokens = drop_bad_tokens(clean_tokens)
+
         if len(clean_tokens) == 0:
             return None, 0.0, False
         clean_tokens = drop_bad_tokens(clean_tokens)
@@ -380,8 +383,8 @@ class ChatterboxTTS:
 
         # Compute audio duration and watermark
         audio_duration = len(audio_chunk) / self.sr
-        watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
-        audio_tensor = torch.from_numpy(watermarked_chunk).unsqueeze(0)
+        # watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+        audio_tensor = torch.from_numpy(audio_chunk).unsqueeze(0)
 
         # Update first‐chunk latency metric
         if metrics.chunk_count == 0:
@@ -422,7 +425,7 @@ class ChatterboxTTS:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
-
+        print("Mono language streaming in generation")
         # Update exaggeration if needed
         if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
             _cond: T3Cond = self.conds.t3
@@ -461,7 +464,6 @@ class ChatterboxTTS:
                 top_p=top_p,
                 **t3_params,
             ):
-
                 # Extract only the conditional batch.
                 token_chunk = token_chunk[0]
 

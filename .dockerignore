@@ -1,0 +1,41 @@
+# Git files
+.git
+.gitignore
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (keep only docker build context optimization)
+docker/output/
+
+# Build and distribution (generated files only)
+build/
+dist/
+*.egg-info/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Log files
+*.log
+
+# Audio output files (will be generated in container)
+*.wav
+*.mp3
+*.flac

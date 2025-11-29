@@ -1,0 +1,25 @@
+services:
+  chatterbox-multilingual:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: chatterbox-multilingual:latest
+    container_name: chatterbox-multilingual-app
+    volumes:
+      # Volume externe pour le code source - évite de reconstruire l'image
+      - ../:/src
+      # Volume pour les fichiers audio générés
+      - ./output:/output
+    # Support GPU NVIDIA activé par défaut
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    
+volumes:
+  output:
+    driver: local

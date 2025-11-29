@@ -80,16 +80,30 @@ class AlignmentStreamAnalyzer:
                 self.last_aligned_attns[buffer_idx] = step_attention[0, head_idx]  # (T0, Ti)
 
         target_layer = tfmr.layers[layer_idx].self_attn
+        
+        # Check if attention implementation supports output_attentions
+        self.alignment_enabled = True
+        if hasattr(tfmr, 'config') and hasattr(tfmr.config, '_attn_implementation'):
+            if tfmr.config._attn_implementation == 'sdpa':
+                print("Warning: SDPA attention implementation detected. Disabling alignment analysis to avoid compatibility issues.")
+                self.alignment_enabled = False
+                return
+        
         # Register hook and store the handle
-        target_layer.register_forward_hook(attention_forward_hook)
-        if hasattr(tfmr, 'config') and hasattr(tfmr.config, 'output_attentions'):
-            self.original_output_attentions = tfmr.config.output_attentions
-            tfmr.config.output_attentions = True
+        if self.alignment_enabled:
+            target_layer.register_forward_hook(attention_forward_hook)
+            if hasattr(tfmr, 'config') and hasattr(tfmr.config, 'output_attentions'):
+                self.original_output_attentions = tfmr.config.output_attentions
+                tfmr.config.output_attentions = True
 
     def step(self, logits, next_token=None):
         """
         Emits an AlignmentAnalysisResult into the output queue, and potentially modifies the logits to force an EOS.
         """
+        # Skip processing if alignment is disabled
+        if not hasattr(self, 'alignment_enabled') or not self.alignment_enabled:
+            return logits
+            
         # extract approximate alignment matrix chunk (1 frame at a time after the first chunk)
         print(
             f"AlignmentStreamAnalyzer: curr_frame_pos={self.curr_frame_pos}, "
