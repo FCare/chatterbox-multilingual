@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
+import time
+from typing import Generator, Tuple, Optional
 import os
 
 import librosa
@@ -306,3 +308,107 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def generate_stream(
+        self,
+        text,
+        language_id, # for API compatibility; not used in this model
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        # streaming parameters
+        chunk_size: int = 25,  # Tokens per chunk 
+        context_window = 50,
+        fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
+        print_metrics: bool = True,
+        # cache optimization params
+        max_new_tokens=1000, 
+        max_cache_len=1500, # Affects the T3 speed, hence important
+        # t3 sampling params
+        repetition_penalty=1.2,
+        min_p=0.05,
+        top_p=1.0,
+        t3_params={},
+    ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
+        start_time = time.time()
+        metrics = StreamingMetrics()
+
+        # Validate language_id
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+        
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        # Update exaggeration if needed
+        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
+            ).to(device=self.device)
+
+        # Norm and tokenize text
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        total_audio_length = 0.0
+        all_tokens_processed = []  # Keep track of all tokens processed so far
+
+        with torch.inference_mode():
+            for token_chunk in self.t3.inference_stream(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=max_new_tokens,  # TODO: use the value in config
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                chunk_size=chunk_size,
+                max_cache_len=max_cache_len,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                **t3_params
+            ):
+
+                # Extract only the conditional batch.
+                token_chunk = token_chunk[0]
+
+                # Process each chunk immediately
+                audio_tensor, audio_duration, success = self._process_token_buffer(
+                    [token_chunk], all_tokens_processed, context_window, 
+                    start_time, metrics, print_metrics, fade_duration
+                )
+                
+                if success:
+                    total_audio_length += audio_duration
+                    yield audio_tensor, metrics
+                
+                # Update all_tokens_processed with the new tokens
+                if len(all_tokens_processed) == 0:
+                    all_tokens_processed = token_chunk
+                else:
+                    all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
+
+            # Final metrics calculation
+            metrics.total_generation_time = time.time() - start_time
+            metrics.total_audio_duration = total_audio_length
+            if total_audio_length > 0:
+                metrics.rtf = metrics.total_generation_time / total_audio_length
+                if print_metrics:
+                    print(f"Total generation time: {metrics.total_generation_time:.3f}s")
+                    print(f"Total audio duration: {metrics.total_audio_duration:.3f}s")
+                    print(f"RTF (Real-Time Factor): {metrics.rtf:.3f}")
+                    print(f"Total chunks yielded: {metrics.chunk_count}")

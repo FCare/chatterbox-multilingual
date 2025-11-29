@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
-from typing import Union, Optional, List
+from typing import Generator, Optional, Optional
 import time
 
 logger = logging.getLogger(__name__)
@@ -550,7 +550,199 @@ class T3(nn.Module):
                     print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
 
         return generated_ids
+    
+    @torch.inference_mode()
+    def inference_stream(
+        self,
+        *,
+        t3_cond: T3Cond,
+        text_tokens: torch.Tensor,
+        max_new_tokens=1000,
+        temperature=0.8,
+        min_p=0.05,
+        top_p=1.0,
+        length_penalty=1.0,
+        repetition_penalty=1.2,
+        cfg_weight=0.5,
+        chunk_size=25,  # Number of tokens per chunk
+        # optimizations
+        max_cache_len=1500,
+        initial_forward_pass_backend="eager",
+        generate_token_backend="cudagraphs-manual",
+        # generate_token_backend="eager",
+        stride_length=4,
+        skip_when_1=True,
+    ) -> Generator[torch.Tensor, None, None]:
+        """
+        Streaming version of T3 inference that yields speech tokens in chunks
+        """
+        from tqdm import tqdm
+        import torch.nn.functional as F
+        from transformers.generation.logits_process import TopPLogitsWarper, RepetitionPenaltyLogitsProcessor
 
+        # Validate inputs
+        text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
+        
+        # Default initial speech to a single start-of-speech token
+        initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+
+        # Prepare custom input embeds
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=initial_speech_tokens,
+            cfg_weight=cfg_weight,
+        )
+
+        # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
+        # Note the llama-specific logic. Other tfmr types can be added later.
+        self.init_patched_model(len_cond=len_cond, text_tokens_size=text_tokens.size(-1))
+        # Pre-compute embeddings cache for the generation loop
+        self.get_speech_pos_embedding_cache(TOKEN_LIMIT + 1 or self.hp.max_speech_tokens, dtype=embeds.dtype)
+        self.init_speech_embedding_cache(vocab_size=self.hp.speech_tokens_dict_size, dtype=embeds.dtype)
+
+        device = embeds.device
+
+        bos_token = torch.tensor([[self.hp.start_speech_token]], dtype=torch.long, device=device)
+        bos_embed = self._speech_embedding_cache[bos_token]
+        bos_embed = bos_embed + self._speech_pos_embedding_cache[0]
+
+        # batch_size=2 for CFG
+        bos_embed = torch.cat([bos_embed, bos_embed])
+
+        # Combine condition and BOS token for the initial input
+        inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+
+        # Track generated token ids; start with the BOS token.
+        PAD_TOKEN_ID = self.hp.stop_speech_token + 1 # Assuming unused
+        bos_len = bos_token.shape[1] # == 1
+        chunk_buffer = []
+
+        # Instantiate the logits processors.
+        self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=skip_when_1)
+
+        # move all inputs to patched_model.dtype
+        inputs_embeds = inputs_embeds.to(self.patched_model.dtype)
+        embeds = embeds.to(self.patched_model.dtype)
+        bos_embed = bos_embed.to(self.patched_model.dtype)
+
+        stop_token_tensor = torch.tensor(self.hp.stop_speech_token, device=self.device)
+        
+        # Fix: Set max_batch_size based on CFG usage
+        effective_batch_size = 2 if cfg_weight > 0.0 else 1
+
+        _, seq_len = inputs_embeds.shape[:2]
+        if max_cache_len < seq_len + max_new_tokens:
+            print(f"Warning: max_cache_len {max_cache_len} is too small for seq_len {seq_len} and max_new_tokens {max_new_tokens}")
+            print(f"Reducing max_new_tokens to {max_cache_len - seq_len}")
+            max_new_tokens = max_cache_len - seq_len
+
+        # using batch size of 1, otherwise use generated_ids[:, i] 
+        assert max_new_tokens < 1500, f"max_new_tokens {max_new_tokens} is too large, maximum is 1500"
+        generated_ids = torch.full((1, bos_len + TOKEN_LIMIT), PAD_TOKEN_ID, dtype=torch.long, device=device)
+        generated_ids[0, :bos_len] = bos_token
+
+        kv_cache = self.get_cache(
+            config=self.patched_model.config,
+            max_batch_size=effective_batch_size,
+            max_cache_len=max_cache_len,
+            device=self.patched_model.device,
+            dtype=self.patched_model.dtype,
+        )
+
+        # Move check higher to avoid polluting the loop
+        assert not kv_cache.get_seq_length() > 0, \
+            "Cannot process large input when cache already has content"
+
+        length_guesstimate = text_tokens.shape[1] * 2
+        print(f"Estimated token count: {length_guesstimate}")
+
+        # ---- Pad input_embeds to fixed length for compilation stability ----
+        # This ensures that input_embeds always has the same shape for torch.compile
+        def pad_to_fixed_length(inputs_embeds: Tensor, TOKEN_LIMIT: int):
+            PADDED_SEQ_LEN = TOKEN_LIMIT  # max possible length
+            pad_len = PADDED_SEQ_LEN - inputs_embeds.shape[1]
+            pad_shape = list(inputs_embeds.shape)
+            pad_shape[1] = pad_len
+            pad_embeds = torch.zeros(pad_shape, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+            inputs_embeds = torch.cat([inputs_embeds, pad_embeds], dim=1)
+
+            return inputs_embeds
+        
+        print(f"Input embeds shape before padding: {inputs_embeds.shape}")
+
+        inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
+
+        # ---- Initial Forward Pass (no kv_cache yet) ----
+        initial_forward_pass = _initial_forward_pass_variants.get(initial_forward_pass_backend, _initial_forward_pass_variants["eager"])
+
+        output_logits = initial_forward_pass(
+            inputs_embeds=inputs_embeds,
+            kv_cache=kv_cache,
+            seq_len=seq_len,
+            patched_model=self.patched_model
+        ).clone()  # Clone to avoid in-place modification issues
+
+
+        indices = torch.arange(1, max_new_tokens + 1, device=generated_ids.device)
+        batch_idx = torch.zeros(1, dtype=torch.long, device=generated_ids.device)
+        if generate_token_backend == "cudagraphs-manual":
+            if not hasattr(self, "cudagraph_wrapper"):
+                self.cudagraph_wrapper = T3StepCUDAGraphWrapper(
+                    generate_t3_token,
+                    self.patched_model,
+                    kv_cache,
+                    self.repetition_penalty_processor,
+                    self.min_p_warper,
+                    self.top_p_warper,
+                )
+            self.cudagraph_wrapper.guard()
+
+            _generate_token_variants["cudagraphs-manual"] = self.cudagraph_wrapper
+
+        generate_token = _generate_token_variants.get(generate_token_backend, _generate_token_variants["eager"])
+        stride_length = stride_length if "stride" in generate_token_backend else 1
+        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
+            i_tensor = indices[i * stride_length]
+            # Check for EOS token.
+            if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
+                if (generated_ids == stop_token_tensor).any():
+                    yield torch.cat(chunk_buffer, dim=1)
+                    break
+	    # Yield chunk when buffer is full
+        if len(chunk_buffer) >= chunk_size:
+            yield torch.cat(chunk_buffer, dim=1)
+            chunk_buffer = []
+
+            # print(kv_cache.get_seq_length().unsqueeze(0))
+            torch.compiler.cudagraph_mark_step_begin()
+            bucket_size = 250
+            max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
+            outputs = generate_token(
+                self._speech_embedding_cache,
+                output_logits,
+                i_tensor,
+                batch_idx,
+                self._speech_pos_embedding_cache,
+                generated_ids,
+                cfg_weight,
+                temperature,
+                self.repetition_penalty_processor,
+                self.min_p_warper,
+                self.top_p_warper,
+                self.patched_model,
+                kv_cache,
+                stride_length,
+                max_position=max_position,
+                alignment_stream_analyzer=self.patched_model.alignment_stream_analyzer,
+            )
+            output_logits = outputs[1]
+            if len(outputs) == 3:
+                generated_ids = outputs[2].clone()
+                chunk_buffer.append(generated_ids)
+            output_logits = output_logits.clone()
+
+        #yield torch.cat(chunk_buffer, dim=1)
 
 def _initial_forward_pass(
     inputs_embeds: Tensor,
@@ -695,4 +887,6 @@ _generate_token_variants = {
     "cudagraphs-strided": torch.compile(generate_t3_tokens_strided, backend="cudagraphs", fullgraph=True),
     "inductor-strided": torch.compile(generate_t3_tokens_strided, backend="inductor", fullgraph=True, mode="max-autotune"),
 }
+
+
 
