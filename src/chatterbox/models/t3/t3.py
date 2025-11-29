@@ -170,12 +170,27 @@ class T3(nn.Module):
         text_latents = torch.zeros(B, len_text, dim, dtype=dtype, device=device)
         speech_latents = torch.zeros(B, len_speech, dim, dtype=dtype, device=device)
         ttl, stl = text_token_lens, speech_token_lens
-        for i in range(B):
-            text_end = len_cond + ttl[i].item()
-            speech_start = len_cond + text_tokens.size(1)
-            speech_end = speech_start + stl[i].item()
-            text_latents[i, :ttl[i]] = hidden_states[i, len_cond:text_end]
-            speech_latents[i, :stl[i]] = hidden_states[i, speech_start:speech_end]
+        # Vectorized extraction without .item() calls
+        speech_start = len_cond + text_tokens.size(1)
+        
+        # Create batch indices for advanced indexing
+        batch_idx = torch.arange(B, device=device, dtype=torch.long)
+        
+        # Extract text latents using advanced indexing
+        max_text_len = ttl.max()
+        text_seq_idx = torch.arange(max_text_len, device=device)[None, :] + len_cond
+        text_mask = torch.arange(max_text_len, device=device)[None, :] < ttl[:, None]
+        text_valid_idx = text_seq_idx.clamp(0, hidden_states.size(1)-1)
+        extracted_text = hidden_states.gather(1, text_valid_idx.unsqueeze(-1).expand(-1, -1, dim))
+        text_latents = torch.where(text_mask.unsqueeze(-1), extracted_text, text_latents)
+        
+        # Extract speech latents using advanced indexing  
+        max_speech_len = stl.max()  # Only one .item() call for max
+        speech_seq_idx = torch.arange(max_speech_len, device=device)[None, :] + speech_start
+        speech_mask = torch.arange(max_speech_len, device=device)[None, :] < stl[:, None]
+        speech_valid_idx = speech_seq_idx.clamp(0, hidden_states.size(1)-1)
+        extracted_speech = hidden_states.gather(1, speech_valid_idx.unsqueeze(-1).expand(-1, -1, dim))
+        speech_latents = torch.where(speech_mask.unsqueeze(-1), extracted_speech, speech_latents)
 
         # logit projection
         text_logits = self.text_head(text_latents)
@@ -500,11 +515,28 @@ class T3(nn.Module):
             start = time.time()
             torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
+
+        # Buffer pour différer les checks EOS
+        eos_check_buffer = []
+
         for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
             i_tensor = indices[i * stride_length]
             # Check for EOS token.
             if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
-                if (generated_ids == stop_token_tensor).any():
+                # Buffer le check au lieu de sync immédiatement
+                eos_mask = (generated_ids == stop_token_tensor)
+                eos_check_buffer.append(eos_mask)
+                
+                # Ne check que si buffer trop grand (évite sync fréquentes)
+                if len(eos_check_buffer) > 5:  # Check tous les 100 steps au lieu de 20
+                    combined_mask = torch.stack(eos_check_buffer).any(dim=0)
+                    has_eos = combined_mask.any().item()  # Une seule sync pour plusieurs checks
+                    if has_eos:
+                        if benchmark_t3:
+                            # torch.cuda.synchronize() # Only if needed
+                            print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
+                        break
+                    eos_check_buffer.clear()
                     if benchmark_t3:
                         torch.cuda.synchronize() # For benchmarking to have correct it/s
                         print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
@@ -729,10 +761,17 @@ class T3(nn.Module):
             
             # Check for EOS token.
             if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
-                if outputs[0].flatten().eq(stop_token_tensor).any():
-                    if chunk_buffer:
-                        yield torch.cat(chunk_buffer, dim=1)
-                    break
+                # Check EOS dans outputs au lieu de generated_ids pour éviter sync
+                # Utilise le dernier token généré directement
+                last_token = outputs[0] if len(outputs) > 0 else None
+                if last_token is not None:
+                    # Compare directement sans .sum() qui force sync
+                    is_eos = (last_token == stop_token_tensor).any()
+                    # Différer le check - garder en buffer
+                    if is_eos:
+                        if chunk_buffer:
+                            yield torch.cat(chunk_buffer, dim=1)
+                        break
                 
             # Yield chunk when buffer is full
             if len(chunk_buffer) >= chunk_size:
@@ -798,9 +837,14 @@ def generate_t3_token(
         if logits.dim() == 1:            # guard in case something upstream squeezed
             logits = logits.unsqueeze(0) # (1, V)
         # Pass the last generated token for repetition tracking
-        last_token = generated_ids[0, -1].item() if len(generated_ids[0]) > 0 else None
-        print(logits, last_token)
-        logits = alignment_stream_analyzer.step(logits, next_token=last_token)  # (1, V)
+        # Avoid .item() call - pass tensor directly if analyzer supports it
+        last_token_tensor = generated_ids[0, -1:] if generated_ids.numel() > 0 else None
+        if hasattr(alignment_stream_analyzer, 'step_tensor'):
+            logits = alignment_stream_analyzer.step_tensor(logits, next_token=last_token_tensor)
+        else:
+            # Fallback to .item() only if necessary
+            last_token = last_token_tensor.item() if last_token_tensor is not None else None
+            logits = alignment_stream_analyzer.step(logits, next_token=last_token)
 
     logits = repetition_penalty_processor(generated_ids, logits)
 

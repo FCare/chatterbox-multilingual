@@ -25,7 +25,8 @@ class T3Cond:
         "Cast to a device and dtype. Dtype casting is ignored for long/int tensors."
         for k, v in self.__dict__.items():
             if torch.is_tensor(v):
-                is_fp = type(v.view(-1)[0].item()) is not int
+                # Éviter .item() - utiliser dtype check direct
+                is_fp = v.dtype.is_floating_point
                 setattr(self, k, v.to(device=device, dtype=dtype if is_fp else None))
         return self
 

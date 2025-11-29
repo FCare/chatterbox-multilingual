@@ -76,7 +76,7 @@ class AlignmentStreamAnalyzer:
             - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
             """
             if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                step_attention = output[1].cpu()  # (B, n_heads, T0, Ti)
+                step_attention = output[1]  # Garder sur GPU
                 self.last_aligned_attns[buffer_idx] = step_attention[0, head_idx]  # (T0, Ti)
 
         target_layer = tfmr.layers[layer_idx].self_attn
@@ -115,10 +115,10 @@ class AlignmentStreamAnalyzer:
         i, j = self.text_tokens_slice
         if self.curr_frame_pos == 0:
             # first chunk has conditioning info, text tokens, and BOS token
-            A_chunk = aligned_attn[j:, i:j].clone().cpu() # (T, S)
+            A_chunk = aligned_attn[j:, i:j].clone()  # Garder sur GPU
         else:
             # subsequent chunks have 1 frame due to KV-caching
-            A_chunk = aligned_attn[:, i:j].clone().cpu() # (1, S)
+            A_chunk = aligned_attn[:, i:j].clone()  # Garder sur GPU
 
         # TODO: monotonic masking; could have issue b/c spaces are often skipped.
         A_chunk[:, self.curr_frame_pos + 1:] = 0
@@ -162,7 +162,11 @@ class AlignmentStreamAnalyzer:
         if next_token is not None:
             # Convert tensor to scalar if needed
             if isinstance(next_token, torch.Tensor):
-                token_id = next_token.item() if next_token.numel() == 1 else next_token.view(-1)[0].item()
+                # Éviter .item() - utiliser des indices tensoriels
+                if next_token.numel() == 1:
+                    token_id = next_token  # Garder comme tensor
+                else:
+                    token_id = next_token.view(-1)[0]  # Premier élément comme tensor
             else:
                 token_id = next_token
             self.generated_tokens.append(token_id)
