@@ -86,7 +86,7 @@ if model:
         
         # Debug: Try streaming with different parameters
         print("Starting streaming...")
-        for chunk_audio, metrics in model.generate_stream(text, chunk_size=100, print_metrics=True):
+        for chunk_audio, metrics in model.generate_stream(text, stream_chunk_size=100, print_metrics=True):
             if chunk_audio is not None:
                 audio_chunks.append(chunk_audio)
                 chunk_count += 1
@@ -99,7 +99,7 @@ if model:
         if audio_chunks:
             # Concatenate all chunks
             full_audio = torch.cat(audio_chunks, dim=-1)
-            ta.save("test-local-3-streaming.wav", full_audio, model.sr)
+            ta.save("test-local-3-streaming.wav", full_audio.cpu(), model.sr)
             print(f"✅ Saved streaming audio to: test-local-3-streaming.wav ({chunk_count} chunks)")
         else:
             print("❌ No audio chunks were generated during streaming")
@@ -122,7 +122,7 @@ if multilingual_model:
         
         # Debug: Try streaming with different parameters
         print("Starting multilingual streaming...")
-        for chunk_audio, metrics in multilingual_model.generate_stream(text, language_id="fr", chunk_size=100, print_metrics=True):
+        for chunk_audio, metrics in multilingual_model.generate_stream(text, language_id="fr", stream_chunk_size=5, print_metrics=True):
             if chunk_audio is not None:
                 audio_chunks.append(chunk_audio)
                 chunk_count += 1
@@ -135,7 +135,7 @@ if multilingual_model:
         if audio_chunks:
             # Concatenate all chunks
             full_audio = torch.cat(audio_chunks, dim=-1)
-            ta.save("test-local-4-streaming.wav", full_audio, multilingual_model.sr)
+            ta.save("test-local-4-streaming.wav", full_audio.detach().cpu(), multilingual_model.sr)
             print(f"✅ Saved streaming audio to: test-local-4-streaming.wav ({chunk_count} chunks)")
         else:
             print("❌ No audio chunks were generated during streaming")

@@ -188,7 +188,7 @@ class VoiceEncoder(nn.Module):
 
         # Forward the partials
         n_chunks = int(np.ceil(len(partials) / (batch_size or len(partials))))
-        partial_embeds = torch.cat([self(batch) for batch in partials.chunk(n_chunks)], dim=0).cpu()
+        partial_embeds = torch.cat([self(batch) for batch in partials.chunk(n_chunks)], dim=0)
 
         # Reduce the partial embeds into full embeds and L2-normalize them
         slices = np.concatenate(([0], np.cumsum(n_partials)))

@@ -261,7 +261,7 @@ class T3(nn.Module):
                 llama=self.tfmr,
                 speech_enc=self.speech_emb,
                 speech_head=self.speech_head,
-                # alignment_stream_analyzer=alignment_stream_analyzer,
+                alignment_stream_analyzer=None,
             )
             self.patched_model = patched_model
             self.compiled = True
@@ -580,41 +580,53 @@ class T3(nn.Module):
                     print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
 
         return generated_ids
-    
+
     @torch.inference_mode()
     def inference_stream(
         self,
         *,
         t3_cond: T3Cond,
-        text_tokens: torch.Tensor,
-        max_new_tokens=1000,
+        text_tokens: Tensor,
+        initial_speech_tokens: Optional[Tensor]=None,
+
+        # misc conditioning
+        prepend_prompt_speech_tokens: Optional[Tensor]=None,
+
+        # HF generate args
+        num_return_sequences=1,
+        max_new_tokens=None,
+        stop_on_eos=True,
+        do_sample=True,
         temperature=0.8,
         min_p=0.05,
         top_p=1.0,
         length_penalty=1.0,
         repetition_penalty=1.2,
-        cfg_weight=0.5,
-        chunk_size=25,  # Number of tokens per chunk
+        cfg_weight=0,
         # optimizations
         max_cache_len=1500,
         initial_forward_pass_backend="eager",
-        # generate_token_backend="cudagraphs-manual",
-        generate_token_backend="eager",
+        generate_token_backend="cudagraphs-manual",
+        # generate_token_backend="eager",
         stride_length=4,
         skip_when_1=True,
-    ) -> Generator[torch.Tensor, None, None]:
+        benchmark_t3=False,
+        # streaming
+        stream_chunk_size=20,
+    ):
         """
-        Streaming version of T3 inference that yields speech tokens in chunks
+        Args:
+            text_tokens: a 1D (unbatched) or 2D (batched) tensor.
         """
-        from tqdm import tqdm
-        import torch.nn.functional as F
-        from transformers.generation.logits_process import TopPLogitsWarper, RepetitionPenaltyLogitsProcessor
-        # Validate inputs
+        start_time = time.time()
+        # Validate / sanitize inputs
+        assert prepend_prompt_speech_tokens is None, "not implemented"
+        _ensure_BOT_EOT(text_tokens, self.hp)
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
-        
-        # Default initial speech to a single start-of-speech token
-        initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
 
+        # Default initial speech to a single start-of-speech token
+        if initial_speech_tokens is None:
+            initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
         # Prepare custom input embeds
         embeds, len_cond = self.prepare_input_embeds(
             t3_cond=t3_cond,
@@ -622,13 +634,28 @@ class T3(nn.Module):
             speech_tokens=initial_speech_tokens,
             cfg_weight=cfg_weight,
         )
-
         # In order to use the standard HF generate method, we need to extend some methods to inject our custom logic
         # Note the llama-specific logic. Other tfmr types can be added later.
         self.init_patched_model(len_cond=len_cond, text_tokens_size=text_tokens.size(-1))
         # Pre-compute embeddings cache for the generation loop
         self.get_speech_pos_embedding_cache(TOKEN_LIMIT + 1 or self.hp.max_speech_tokens, dtype=embeds.dtype)
         self.init_speech_embedding_cache(vocab_size=self.hp.speech_tokens_dict_size, dtype=embeds.dtype)
+        # # Run normal generate method, which calls our custom extended methods
+        # return self.patched_model.generate(
+        #     inputs=initial_speech_tokens,
+        #     decoder_cond=embeds,
+        #     bos_token_id=self.hp.start_speech_token,
+        #     eos_token_id=(self.hp.stop_speech_token if stop_on_eos else -1),
+        #     pad_token_id=self.hp.stop_speech_token,
+        #     max_new_tokens=max_new_tokens or self.hp.max_speech_tokens,
+        #     num_return_sequences=num_return_sequences,
+        #     temperature=temperature,
+        #     min_p=min_p,
+        #     length_penalty=length_penalty,
+        #     repetition_penalty=repetition_penalty,
+        #     do_sample=do_sample,
+        #     # cache_implementation=None if not self.compiled else "static",
+        # )
 
         device = embeds.device
 
@@ -638,24 +665,24 @@ class T3(nn.Module):
 
         # batch_size=2 for CFG
         bos_embed = torch.cat([bos_embed, bos_embed])
+
         # Combine condition and BOS token for the initial input
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
 
         # Track generated token ids; start with the BOS token.
         PAD_TOKEN_ID = self.hp.stop_speech_token + 1 # Assuming unused
         bos_len = bos_token.shape[1] # == 1
-        chunk_buffer = []
         # Instantiate the logits processors.
         self.update_processors(top_p, min_p, repetition_penalty, skip_when_1=skip_when_1)
-
         # move all inputs to patched_model.dtype
         inputs_embeds = inputs_embeds.to(self.patched_model.dtype)
         embeds = embeds.to(self.patched_model.dtype)
         bos_embed = bos_embed.to(self.patched_model.dtype)
+
         stop_token_tensor = torch.tensor(self.hp.stop_speech_token, device=self.device)
-        
         # Fix: Set max_batch_size based on CFG usage
         effective_batch_size = 2 if cfg_weight > 0.0 else 1
+
         _, seq_len = inputs_embeds.shape[:2]
         if max_cache_len < seq_len + max_new_tokens:
             print(f"Warning: max_cache_len {max_cache_len} is too small for seq_len {seq_len} and max_new_tokens {max_new_tokens}")
@@ -674,13 +701,11 @@ class T3(nn.Module):
             device=self.patched_model.device,
             dtype=self.patched_model.dtype,
         )
-
         # Move check higher to avoid polluting the loop
         assert not kv_cache.get_seq_length() > 0, \
             "Cannot process large input when cache already has content"
 
         length_guesstimate = text_tokens.shape[1] * 2
-        print(f"Estimated token count: {length_guesstimate}")
 
         # ---- Pad input_embeds to fixed length for compilation stability ----
         # This ensures that input_embeds always has the same shape for torch.compile
@@ -694,8 +719,6 @@ class T3(nn.Module):
 
             return inputs_embeds
         
-        print(f"Input embeds shape before padding: {inputs_embeds.shape}")
-
         inputs_embeds = pad_to_fixed_length(inputs_embeds, TOKEN_LIMIT)
 
         # ---- Initial Forward Pass (no kv_cache yet) ----
@@ -707,7 +730,7 @@ class T3(nn.Module):
             seq_len=seq_len,
             patched_model=self.patched_model
         ).clone()  # Clone to avoid in-place modification issues
-        #Je vais louper le premier batch si je ne l'ajoute pas....
+
         indices = torch.arange(1, max_new_tokens + 1, device=generated_ids.device)
         batch_idx = torch.zeros(1, dtype=torch.long, device=generated_ids.device)
         if generate_token_backend == "cudagraphs-manual":
@@ -723,15 +746,68 @@ class T3(nn.Module):
             self.cudagraph_wrapper.guard()
 
             _generate_token_variants["cudagraphs-manual"] = self.cudagraph_wrapper
+
         generate_token = _generate_token_variants.get(generate_token_backend, _generate_token_variants["eager"])
+        if benchmark_t3:
+            start = time.time()
+            torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
-  
-        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True):
+
+        # STREAMING SIMPLE: compteur de tokens générés
+        def get_en_pos(vector):
+            # Masque des tokens PAD
+            pad_mask = vector[0] == PAD_TOKEN_ID
+            # Trouver position du premier PAD
+            first_pad_pos = torch.argmax(pad_mask.int()).item()
+            # Si pas de PAD trouvé, utiliser taille complète
+            if first_pad_pos == 0 and not pad_mask[0]:
+                return generated_ids.size(1)  # Aucun PAD
+            else:
+                return first_pad_pos  # Position du premier PAD
+            
+        start_yield_pos = 0
+        end_yield_pos = get_en_pos(generated_ids)
+
+        # Buffer pour différer les checks EOS
+        eos_check_buffer = []
+
+        for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
             i_tensor = indices[i * stride_length]
-            bucket_size = 500
-            max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
+            # Check for EOS token.
+            if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
+                # Buffer le check au lieu de sync immédiatement
+                eos_mask = (generated_ids == stop_token_tensor)
+                eos_check_buffer.append(eos_mask)
+                
+                # Ne check que si buffer trop grand (évite sync fréquentes)
+                if len(eos_check_buffer) > 5:  # Check tous les 100 steps au lieu de 20
+                    combined_mask = torch.stack(eos_check_buffer).any(dim=0)
+                    has_eos = combined_mask.any().item()  # Une seule sync pour plusieurs checks
+                    if has_eos:
+                        # Yield dernier chunk et stop
+                        while end_yield_pos - start_yield_pos >= stream_chunk_size:
+                            chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size].clone()
+                            yield chunk
+                            start_yield_pos += stream_chunk_size
+                        if (start_yield_pos != end_yield_pos):
+                            chunk = generated_ids[0, start_yield_pos:end_yield_pos].clone()
+                            yield chunk
+                        if benchmark_t3:
+                            # torch.cuda.synchronize() # Only if needed
+                            print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
+                        break
+                    eos_check_buffer.clear()
+                    if benchmark_t3:
+                        torch.cuda.synchronize() # For benchmarking to have correct it/s
+                        print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
+                        print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
+                        # it/s
+                        print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+                    break
             # print(kv_cache.get_seq_length().unsqueeze(0))
             torch.compiler.cudagraph_mark_step_begin()
+            bucket_size = 500
+            max_position = get_next_bucket(i + seq_len, bucket_size, TOKEN_LIMIT) if generate_token_backend == "cudagraphs-manual" else None
             outputs = generate_token(
                 self._speech_embedding_cache,
                 output_logits,
@@ -753,33 +829,27 @@ class T3(nn.Module):
             output_logits = outputs[1]
             if len(outputs) == 3:
                 generated_ids = outputs[2].clone()
-                chunk_buffer.append(generated_ids)
-            else:
-                if len(outputs) >= 1:
-                    token_ids = outputs[0]
-                    chunk_buffer.append(token_ids)
-            
-            # Check for EOS token.
-            if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
-                # Check EOS dans outputs au lieu de generated_ids pour éviter sync
-                # Utilise le dernier token généré directement
-                last_token = outputs[0] if len(outputs) > 0 else None
-                if last_token is not None:
-                    # Compare directement sans .sum() qui force sync
-                    is_eos = (last_token == stop_token_tensor).any()
-                    # Différer le check - garder en buffer
-                    if is_eos:
-                        if chunk_buffer:
-                            yield torch.cat(chunk_buffer, dim=1)
-                        break
-                
-            # Yield chunk when buffer is full
-            if len(chunk_buffer) >= chunk_size:
-                yield torch.cat(chunk_buffer, dim=1)
-                chunk_buffer = []
-
+                end_yield_pos = get_en_pos(generated_ids)
+		        # Yield dernier chunk et stop
+                while end_yield_pos - start_yield_pos >= stream_chunk_size:
+                    chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size].clone()
+                    yield chunk
+                    start_yield_pos += stream_chunk_size
             output_logits = output_logits.clone()
-
+            if benchmark_t3:
+                torch.cuda.synchronize() # For benchmarking to have correct it/s
+                print(f"Stopping at {(i + 1) * stride_length} because max_new_tokens reached")
+                print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
+                print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+                
+        while end_yield_pos - start_yield_pos >= stream_chunk_size:
+            chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size].clone()
+            yield chunk
+            start_yield_pos += stream_chunk_size
+        if (start_yield_pos != end_yield_pos):
+            chunk = generated_ids[0, start_yield_pos:end_yield_pos].clone()
+            yield chunk
+    
 def _initial_forward_pass(
     inputs_embeds: Tensor,
     kv_cache: StaticCache,

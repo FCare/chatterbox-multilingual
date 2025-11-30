@@ -43,7 +43,11 @@ class EnTokenizer:
 
     def decode(self, seq):
         if isinstance(seq, torch.Tensor):
-            seq = seq.cpu().numpy()
+            # Garde sur GPU si possible, transfère seulement si nécessaire
+            if seq.device.type != 'cpu':
+                seq = seq.cpu().numpy()
+            else:
+                seq = seq.numpy()
 
         txt: str = self.tokenizer.decode(seq, skip_special_tokens=False)
         txt = txt.replace(' ', '')
@@ -354,7 +358,11 @@ class MTLTokenizer:
 
     def decode(self, seq):
         if isinstance(seq, torch.Tensor):
-            seq = seq.cpu().numpy()
+            # Garde sur GPU si possible, transfère seulement si nécessaire
+            if seq.device.type != 'cpu':
+                seq = seq.cpu().numpy()
+            else:
+                seq = seq.numpy()
 
         txt = self.tokenizer.decode(seq, skip_special_tokens=False)
         txt = txt.replace(' ', '').replace(SPACE, ' ').replace(EOT, '').replace(UNK, '')

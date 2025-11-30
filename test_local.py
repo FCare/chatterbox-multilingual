@@ -34,7 +34,7 @@ model = ChatterboxTTS.from_pretrained(device=device)
 text = "Ezreal and Jinx teamed up with Ahri, Yasuo, and Teemo to take down the enemy's Nexus in an epic late-game pentakill."
 print(f"Generating: {text}")
 wav = model.generate(text)
-ta.save("test-local-1.wav", wav, model.sr)
+ta.save("test-local-1.wav", wav.cpu(), model.sr)
 print("✅ Saved to: test-local-1.wav")
 
 # Test 2: Multilingual TTS (French)
@@ -44,7 +44,7 @@ multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
 text = "Bonjour, comment ça va? Ceci est le modèle de synthèse vocale multilingue Chatterbox, il prend en charge 23 langues."
 print(f"Generating: {text}")
 wav = multilingual_model.generate(text, language_id="fr")
-ta.save("test-local-2.wav", wav, multilingual_model.sr)
+ta.save("test-local-2.wav", wav.cpu(), multilingual_model.sr)
 print("✅ Saved to: test-local-2.wav")
 
 # Test 3: English with voice prompt (if available)
@@ -54,7 +54,7 @@ AUDIO_PROMPT_PATH = "YOUR_FILE.wav"
 if os.path.exists(AUDIO_PROMPT_PATH):
     print(f"Using audio prompt: {AUDIO_PROMPT_PATH}")
     wav = model.generate(text, audio_prompt_path=AUDIO_PROMPT_PATH)
-    ta.save("test-local-3.wav", wav, model.sr)
+    ta.save("test-local-3.wav", wav.cpu(), model.sr)
     print("✅ Saved to: test-local-3.wav")
 else:
     print(f"⚠️  Audio prompt file not found: {AUDIO_PROMPT_PATH}")

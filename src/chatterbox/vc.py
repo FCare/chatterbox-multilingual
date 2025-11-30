@@ -99,6 +99,13 @@ class ChatterboxVC:
                 speech_tokens=s3_tokens,
                 ref_dict=self.ref_dict,
             )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+            wav_squeezed = wav.squeeze(0).detach()
+            # Transfert CPU uniquement si watermarking requis
+            if hasattr(self, 'watermarker') and self.watermarker:
+                wav_numpy = wav_squeezed.cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
+                return torch.from_numpy(watermarked_wav).unsqueeze(0)
+            else:
+                return wav_squeezed.unsqueeze(0)
+        # Fallback si pas dans le try block
         return torch.from_numpy(watermarked_wav).unsqueeze(0)

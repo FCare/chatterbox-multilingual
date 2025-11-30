@@ -239,7 +239,10 @@ class ChatterboxMultilingualTTS:
             t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
 
         # Voice-encoder speaker embedding
-        ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
+        ve_embed = self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR)
+        # Handle tensor ou numpy array retournés par Voice Encoder optimisé
+        if isinstance(ve_embed, np.ndarray):
+            ve_embed = torch.from_numpy(ve_embed)
         ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
 
         t3_cond = T3Cond(
@@ -334,9 +337,8 @@ class ChatterboxMultilingualTTS:
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
             )
-            wav = wav.squeeze(0).detach().cpu().numpy()
             # watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(wav).unsqueeze(0)
+        return wav.detach().cpu()
 
     def _process_token_buffer(
         self,
@@ -367,6 +369,8 @@ class ChatterboxMultilingualTTS:
 
         # Drop any invalid tokens and move to the correct device
         clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
+        if len(clean_tokens) == 0:
+            return None, 0.0, False
         def drop_bad_tokens(tokens):
             # Use torch.where instead of boolean indexing to avoid sync
             mask = tokens < 6561
@@ -377,45 +381,42 @@ class ChatterboxMultilingualTTS:
             # Use torch.masked_select which is more CUDA-friendly
             result = torch.masked_select(tokens, mask)
             return result
-        clean_tokens = drop_bad_tokens(clean_tokens)
-
-        if len(clean_tokens) == 0:
-            return None, 0.0, False
+        
         clean_tokens = drop_bad_tokens(clean_tokens)
         if len(clean_tokens) == 0:
             return None, 0.0, False
-
         # Run S3Gen inference to get a waveform (1 × T)
         wav, _ = self.s3gen.inference(
             speech_tokens=clean_tokens,
             ref_dict=self.conds.gen,
         )
-        wav = wav.squeeze(0).detach().cpu().numpy()
+        # Pas de squeeze - garde dimension batch (1, samples)
+        audio_chunk = wav.detach()
 
         # If we have context tokens, crop out the samples corresponding to them
         if context_length > 0:
-            samples_per_token = len(wav) / len(clean_tokens)
+            samples_per_token = audio_chunk.shape[-1] / len(clean_tokens)
             skip_samples = int(context_length * samples_per_token)
-            audio_chunk = wav[skip_samples:]
-        else:
-            audio_chunk = wav
+            audio_chunk = audio_chunk[..., skip_samples:]
 
-        if len(audio_chunk) == 0:
+        if audio_chunk.shape[-1] == 0:
             return None, 0.0, False
 
         # Apply a short linear fade-in on the new chunk to smooth boundaries
         fade_samples = int(fade_duration * self.sr)
         if fade_samples > 0:
-            if fade_samples > len(audio_chunk):
-                fade_samples = len(audio_chunk)
-            fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=audio_chunk.dtype)
-            audio_chunk[:fade_samples] *= fade_in
+            if fade_samples > audio_chunk.shape[-1]:
+                fade_samples = audio_chunk.shape[-1]
+            # GPU-native fade-in avec torch.linspace
+            fade_in = torch.linspace(0.0, 1.0, fade_samples,
+                                   dtype=audio_chunk.dtype,
+                                   device=audio_chunk.device)
+            audio_chunk[..., :fade_samples] *= fade_in
 
         # Compute audio duration and watermark
-        audio_duration = len(audio_chunk) / self.sr
+        audio_duration = audio_chunk.shape[-1] / self.sr
         # watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
-        audio_tensor = torch.from_numpy(audio_chunk).unsqueeze(0)
-
+        audio_tensor = audio_chunk  # Plus besoin d'unsqueeze
         # Update first‐chunk latency metric
         if metrics.chunk_count == 0:
             metrics.latency_to_first_chunk = time.time() - start_time
@@ -434,7 +435,7 @@ class ChatterboxMultilingualTTS:
         cfg_weight=0.5,
         temperature=0.8,
         # streaming parameters
-        chunk_size: int = 25,  # Tokens per chunk 
+        stream_chunk_size: int = 25,  # Tokens per chunk 
         context_window = 50,
         fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
         print_metrics: bool = True,
@@ -471,13 +472,11 @@ class ChatterboxMultilingualTTS:
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
                 emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
             ).to(device=self.device)
-
         # Norm and tokenize text
         text = punc_norm(text)
         text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
         if cfg_weight > 0.0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
-
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
@@ -493,17 +492,16 @@ class ChatterboxMultilingualTTS:
                 max_new_tokens=max_new_tokens,  # TODO: use the value in config
                 temperature=temperature,
                 cfg_weight=cfg_weight,
-                chunk_size=chunk_size,
                 max_cache_len=max_cache_len,
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                stream_chunk_size=stream_chunk_size,
                 **t3_params
             ):
                 # Extract only the conditional batch.
-                token_chunk = token_chunk[0]
 
-                # Process each chunk immediately
+                # Process each chunk immediately - Half the time of generation.
                 audio_tensor, audio_duration, success = self._process_token_buffer(
                     [token_chunk], all_tokens_processed, context_window, 
                     start_time, metrics, print_metrics, fade_duration
