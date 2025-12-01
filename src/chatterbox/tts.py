@@ -21,6 +21,11 @@ from .models.t3.modules.cond_enc import T3Cond
 
 REPO_ID = "ResembleAI/chatterbox"
 
+# Supported languages for the english model
+SUPPORTED_LANGUAGES = {
+  "en": "English",
+}
+
 
 def punc_norm(text: str) -> str:
     """
@@ -57,12 +62,20 @@ def punc_norm(text: str) -> str:
 
     # Add full stop if no ending punc
     text = text.rstrip(" ")
-    sentence_enders = {".", "!", "?", "-", ","}
+    sentence_enders = {".", "!", "?", "-", ",","、","，","。","？","！"}
     if not any(text.endswith(p) for p in sentence_enders):
         text += "."
 
     return text
 
+@dataclass
+class StreamingMetrics:
+    """Metrics for streaming TTS generation"""
+    latency_to_first_chunk: Optional[float] = None
+    rtf: Optional[float] = None
+    total_generation_time: Optional[float] = None
+    total_audio_duration: Optional[float] = None
+    chunk_count: int = 0
 
 @dataclass
 class Conditionals:
@@ -105,14 +118,6 @@ class Conditionals:
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
-@dataclass
-class StreamingMetrics:
-    """Metrics for streaming TTS generation"""
-    latency_to_first_chunk: Optional[float] = None
-    rtf: Optional[float] = None
-    total_generation_time: Optional[float] = None
-    total_audio_duration: Optional[float] = None
-    chunk_count: int = 0
 
 class ChatterboxTTS:
     ENC_COND_LEN = 6 * S3_SR
@@ -135,6 +140,11 @@ class ChatterboxTTS:
         self.device = device
         self.conds = conds
         # self.watermarker = perth.PerthImplicitWatermarker()
+
+    @classmethod
+    def get_supported_languages(cls):
+        """Return dictionary of supported language codes and names."""
+        return SUPPORTED_LANGUAGES.copy()
 
     @classmethod
     def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
@@ -200,6 +210,7 @@ class ChatterboxTTS:
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
 
         # Speech cond prompt tokens
+        t3_cond_prompt_tokens = None
         if plen := self.t3.hp.speech_cond_prompt_len:
             s3_tokzr = self.s3gen.tokenizer
             t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:self.ENC_COND_LEN]], max_len=plen)
@@ -222,7 +233,7 @@ class ChatterboxTTS:
     def generate(
         self,
         text,
-        language_id=None, # for API compatibility; not used in this model
+        language_id="en", # for API compatibility; not used in this model
         audio_prompt_path=None,
         exaggeration=0.5,
         cfg_weight=0.5,
@@ -237,6 +248,14 @@ class ChatterboxTTS:
         n_timesteps = 5,
         t3_params={},
     ):
+        # Validate language_id
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+        
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
@@ -253,7 +272,7 @@ class ChatterboxTTS:
 
         # Norm and tokenize text
         text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
 
         if cfg_weight > 0.0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
@@ -277,40 +296,31 @@ class ChatterboxTTS:
                 **t3_params,
             )
 
-            
-            def speech_to_wav(speech_tokens):
-                # Extract only the conditional batch.
-                speech_tokens = speech_tokens[0]
+            # Extract only the conditional batch.
+            speech_tokens = speech_tokens[0]
+            def drop_bad_tokens(tokens):
+                # Use torch.where instead of boolean indexing to avoid sync
+                mask = tokens < 6561
+                # Count valid tokens without transferring to CPU
+                valid_count = torch.sum(mask).item()
+                # Create output tensor of the right size
+                result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
+                # Use torch.masked_select which is more CUDA-friendly
+                result = torch.masked_select(tokens, mask)
+                return result
 
-                # TODO: output becomes 1D
-                speech_tokens = drop_invalid_tokens(speech_tokens)
-                
-                def drop_bad_tokens(tokens):
-                    # Use torch.where instead of boolean indexing to avoid sync
-                    mask = tokens < 6561
-                    # Count valid tokens without transferring to CPU
-                    valid_count = torch.sum(mask).item()
-                    # Create output tensor of the right size
-                    result = torch.zeros(valid_count, dtype=tokens.dtype, device=tokens.device)
-                    # Use torch.masked_select which is more CUDA-friendly
-                    result = torch.masked_select(tokens, mask)
-                    return result
+            # TODO: output becomes 1D
+            speech_tokens = drop_invalid_tokens(speech_tokens)
+            speech_tokens = drop_bad_tokens(speech_tokens)
+            speech_tokens = speech_tokens.to(self.device)
 
-                # speech_tokens = speech_tokens[speech_tokens < 6561]
-                speech_tokens = drop_bad_tokens(speech_tokens)
-                import time
-                start = time.time()
-                wav, _ = self.s3gen.inference(
-                    speech_tokens=speech_tokens,
-                    ref_dict=self.conds.gen,
-                    n_timesteps=n_timesteps,
-                )
-                end = time.time()
-                print(f"S3Gen inference time: {end - start:.2f} seconds")
-                #watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-                return wav.detach().cpu()
-
-            return speech_to_wav(speech_tokens)
+            wav, _ = self.s3gen.inference(
+                speech_tokens=speech_tokens,
+                ref_dict=self.conds.gen,
+                n_timesteps=n_timesteps,
+            )
+            # watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        return wav.detach().cpu()
 
     def _process_token_buffer(
         self,
@@ -321,7 +331,7 @@ class ChatterboxTTS:
         metrics,
         print_metrics,
         fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
-        n_timesteps = 5
+        n_timesteps = 5,
     ):
 
         # Combine buffered chunks of tokens
@@ -406,7 +416,7 @@ class ChatterboxTTS:
     def generate_stream(
         self,
         text,
-        language_id=None, # for API compatibility; not used in this model
+        language_id="en", # for API compatibility; not used in this model
         audio_prompt_path=None,
         exaggeration=0.5,
         cfg_weight=0.5,
@@ -426,7 +436,9 @@ class ChatterboxTTS:
         n_timesteps = 5,
         t3_params={},
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
-        print("Mono language streaming in generation")
+        start_time = time.time()
+        metrics = StreamingMetrics()
+        print("English language streaming in generation")
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
@@ -434,8 +446,6 @@ class ChatterboxTTS:
                 f"Unsupported language_id '{language_id}'. "
                 f"Supported languages: {supported_langs}"
             )
-        start_time = time.time()
-        metrics = StreamingMetrics()
         
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -490,6 +500,7 @@ class ChatterboxTTS:
                     [token_chunk], all_tokens_processed, context_window, 
                     start_time, metrics, print_metrics, fade_duration, n_timesteps
                 )
+                
                 if success:
                     total_audio_length += audio_duration
                     yield audio_tensor, metrics

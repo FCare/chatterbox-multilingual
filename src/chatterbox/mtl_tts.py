@@ -295,9 +295,10 @@ class ChatterboxMultilingualTTS:
         # Norm and tokenize text
         text = punc_norm(text)
         text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
+
         if cfg_weight > 0.0:
-        	text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
-            
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
@@ -316,6 +317,7 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
                 **t3_params,
             )
+
             # Extract only the conditional batch.
             speech_tokens = speech_tokens[0]
             def drop_bad_tokens(tokens):
@@ -384,10 +386,12 @@ class ChatterboxMultilingualTTS:
             # Use torch.masked_select which is more CUDA-friendly
             result = torch.masked_select(tokens, mask)
             return result
-        
+
         clean_tokens = drop_bad_tokens(clean_tokens)
         if len(clean_tokens) == 0:
             return None, 0.0, False
+
+
         # Run S3Gen inference to get a waveform (1 × T)
         wav, _ = self.s3gen.inference(
             speech_tokens=clean_tokens,
@@ -421,6 +425,7 @@ class ChatterboxMultilingualTTS:
         audio_duration = audio_chunk.shape[-1] / self.sr
         # watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
         audio_tensor = audio_chunk  # Plus besoin d'unsqueeze
+
         # Update first‐chunk latency metric
         if metrics.chunk_count == 0:
             metrics.latency_to_first_chunk = time.time() - start_time
@@ -439,7 +444,7 @@ class ChatterboxMultilingualTTS:
         cfg_weight=0.5,
         temperature=0.8,
         # streaming parameters
-        stream_chunk_size: List[int] = [20,50,100],  # Tokens per chunk 
+        stream_chunk_size: List[int] = [20,50,100],  # Tokens per chunk - Ramp up 
         context_window = 50,
         fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
         print_metrics: bool = True,
@@ -477,11 +482,17 @@ class ChatterboxMultilingualTTS:
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
                 emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=_cond.speaker_emb.dtype),
             ).to(device=self.device)
+
         # Norm and tokenize text
         text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
+        try:
+            text_tokens = self.tokenizer.text_to_tokens(text, language_id=language_id.lower() if language_id else None).to(self.device)
+        except TypeError:
+            text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+
         if cfg_weight > 0.0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
@@ -506,7 +517,7 @@ class ChatterboxMultilingualTTS:
             ):
                 # Extract only the conditional batch.
 
-                # Process each chunk immediately - Half the time of generation.
+                # Process each chunk immediately
                 audio_tensor, audio_duration, success = self._process_token_buffer(
                     [token_chunk], all_tokens_processed, context_window, 
                     start_time, metrics, print_metrics, fade_duration, n_timesteps
