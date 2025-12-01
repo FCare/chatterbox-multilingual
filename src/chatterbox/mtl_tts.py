@@ -270,6 +270,7 @@ class ChatterboxMultilingualTTS:
         top_p=1.0,
         n_timesteps = 5,
         t3_params={},
+        print_metrics=False,
     ):
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
