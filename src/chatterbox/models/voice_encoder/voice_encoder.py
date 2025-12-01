@@ -199,14 +199,16 @@ class VoiceEncoder(nn.Module):
         return embeds
 
     @staticmethod
-    def utt_to_spk_embed(utt_embeds: np.ndarray):
-        """
-        Takes an array of L2-normalized utterance embeddings, computes the mean embedding and L2-normalize it to get a
-        speaker embedding.
-        """
-        assert utt_embeds.ndim == 2
-        utt_embeds = np.mean(utt_embeds, axis=0)
-        return utt_embeds / np.linalg.norm(utt_embeds, 2)
+    def utt_to_spk_embed(utt_embeds):
+        if torch.is_tensor(utt_embeds):
+            assert utt_embeds.ndim == 2
+            utt_embeds = torch.mean(utt_embeds, dim=0)
+            return utt_embeds / torch.linalg.norm(utt_embeds, ord=2)
+        else:
+            # Version numpy (original)
+            assert utt_embeds.ndim == 2
+            utt_embeds = np.mean(utt_embeds, axis=0)
+            return utt_embeds / np.linalg.norm(utt_embeds, 2)
 
     @staticmethod
     def voice_similarity(embeds_x: np.ndarray, embeds_y: np.ndarray):
@@ -239,7 +241,7 @@ class VoiceEncoder(nn.Module):
 
         # Embed them
         with torch.inference_mode():
-            utt_embeds = self.inference(mels.to(self.device), mel_lens, batch_size=batch_size, **kwargs).numpy()
+            utt_embeds = self.inference(mels.to(self.device), mel_lens, batch_size=batch_size, **kwargs)
 
         return self.utt_to_spk_embed(utt_embeds) if as_spk else utt_embeds
 
