@@ -17,6 +17,7 @@ from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+from .models.watermarker import OptimizedPerthImplicitWatermarker
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -139,7 +140,7 @@ class ChatterboxTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        # self.watermarker = perth.PerthImplicitWatermarker()
+        self.watermarker = OptimizedPerthImplicitWatermarker(device=device)
 
     @classmethod
     def get_supported_languages(cls):
@@ -319,8 +320,10 @@ class ChatterboxTTS:
                 ref_dict=self.conds.gen,
                 n_timesteps=n_timesteps,
             )
-            # watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return wav.detach().cpu()
+            watermarked_wav = self.watermarker.apply_watermark(wav.squeeze(0), sample_rate=self.sr).unsqueeze(0)
+	gc.collect()
+	torch.cuda.empty_cache()
+        return watermarked_wav.detach().cpu()
 
     def _process_token_buffer(
         self,
@@ -371,13 +374,11 @@ class ChatterboxTTS:
 
 
         # Run S3Gen inference to get a waveform (1 × T)
-        wav, _ = self.s3gen.inference(
+        audio_chunk, _ = self.s3gen.inference(
             speech_tokens=clean_tokens,
             ref_dict=self.conds.gen,
             n_timesteps=n_timesteps,
         )
-        # Pas de squeeze - garde dimension batch (1, samples)
-        audio_chunk = wav.detach()
 
         # If we have context tokens, crop out the samples corresponding to them
         if context_length > 0:
@@ -401,8 +402,7 @@ class ChatterboxTTS:
 
         # Compute audio duration and watermark
         audio_duration = audio_chunk.shape[-1] / self.sr
-        # watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
-        audio_tensor = audio_chunk  # Plus besoin d'unsqueeze
+        watermarked_chunk = self.watermarker.apply_watermark(audio_chunk.squeeze(0), sample_rate=self.sr).unsqueeze(0)
 
         # Update first‐chunk latency metric
         if metrics.chunk_count == 0:
@@ -411,7 +411,7 @@ class ChatterboxTTS:
                 print(f"Latency to first chunk: {metrics.latency_to_first_chunk:.3f}s")
 
         metrics.chunk_count += 1
-        return audio_tensor, audio_duration, True
+        return watermarked_chunk, audio_duration, True
     
     def generate_stream(
         self,

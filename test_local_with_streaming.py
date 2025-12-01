@@ -26,7 +26,7 @@ else:
     device = "cpu"
 
 print(f"Using device: {device}")
-print("Loading models from local sources (watermarker disabled)...")
+print("Loading models from local sources...")
 
 def t3_to(model, dtype):
     model.t3.to(dtype=dtype)
