@@ -234,6 +234,7 @@ class ChatterboxTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        n_timesteps = 5,
         t3_params={},
     ):
         if audio_prompt_path:
@@ -302,7 +303,7 @@ class ChatterboxTTS:
                 wav, _ = self.s3gen.inference(
                     speech_tokens=speech_tokens,
                     ref_dict=self.conds.gen,
-                    n_timesteps=5,
+                    n_timesteps=n_timesteps,
                 )
                 end = time.time()
                 print(f"S3Gen inference time: {end - start:.2f} seconds")
@@ -319,7 +320,8 @@ class ChatterboxTTS:
         start_time,
         metrics,
         print_metrics,
-        fade_duration=0.02  # seconds to apply linear fade-in on each chunk
+        fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
+        n_timesteps = 5
     ):
 
         # Combine buffered chunks of tokens
@@ -362,7 +364,7 @@ class ChatterboxTTS:
         wav, _ = self.s3gen.inference(
             speech_tokens=clean_tokens,
             ref_dict=self.conds.gen,
-            n_timesteps=5,
+            n_timesteps=n_timesteps,
         )
         # Pas de squeeze - garde dimension batch (1, samples)
         audio_chunk = wav.detach()
@@ -421,6 +423,7 @@ class ChatterboxTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        n_timesteps = 5,
         t3_params={},
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         print("Mono language streaming in generation")
@@ -485,7 +488,7 @@ class ChatterboxTTS:
                 # Process each chunk immediately
                 audio_tensor, audio_duration, success = self._process_token_buffer(
                     [token_chunk], all_tokens_processed, context_window, 
-                    start_time, metrics, print_metrics, fade_duration
+                    start_time, metrics, print_metrics, fade_duration, n_timesteps
                 )
                 if success:
                     total_audio_length += audio_duration

@@ -267,6 +267,7 @@ class ChatterboxMultilingualTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        n_timesteps = 5,
         t3_params={},
     ):
         # Validate language_id
@@ -336,7 +337,7 @@ class ChatterboxMultilingualTTS:
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
-                n_timesteps=5,
+                n_timesteps=n_timesteps,
             )
             # watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return wav.detach().cpu()
@@ -349,7 +350,8 @@ class ChatterboxMultilingualTTS:
         start_time,
         metrics,
         print_metrics,
-        fade_duration=0.02  # seconds to apply linear fade-in on each chunk
+        fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
+        n_timesteps = 5,
     ):
 
         # Combine buffered chunks of tokens
@@ -390,7 +392,7 @@ class ChatterboxMultilingualTTS:
         wav, _ = self.s3gen.inference(
             speech_tokens=clean_tokens,
             ref_dict=self.conds.gen,
-            n_timesteps=5,
+            n_timesteps=n_timesteps,
         )
         # Pas de squeeze - garde dimension batch (1, samples)
         audio_chunk = wav.detach()
@@ -448,6 +450,7 @@ class ChatterboxMultilingualTTS:
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
+        n_timesteps = 5,
         t3_params={},
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         start_time = time.time()
@@ -506,7 +509,7 @@ class ChatterboxMultilingualTTS:
                 # Process each chunk immediately - Half the time of generation.
                 audio_tensor, audio_duration, success = self._process_token_buffer(
                     [token_chunk], all_tokens_processed, context_window, 
-                    start_time, metrics, print_metrics, fade_duration
+                    start_time, metrics, print_metrics, fade_duration, n_timesteps
                 )
                 
                 if success:
