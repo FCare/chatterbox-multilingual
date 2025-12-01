@@ -36,6 +36,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
         encoder: torch.nn.Module = None,
         length_regulator: torch.nn.Module = None,
         decoder: torch.nn.Module = None,
+        use_fp16: bool = False,
         decoder_conf: Dict = {
             'in_channels': 240,
             'out_channel': 80,
@@ -132,10 +133,10 @@ class MaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat,
                   prompt_feat_len,
                   embedding,
-                  flow_cache):
-        if self.fp16 is True:
-            prompt_feat = prompt_feat.half()
-            embedding = embedding.half()
+                  flow_cache,
+                  n_timesteps: int):
+        embedding = embedding.to(self.spk_embed_affine_layer.weight.dtype)
+        prompt_feat = prompt_feat.to(self.spk_embed_affine_layer.weight.dtype)
 
         assert token.shape[0] == 1
         # xvec projection
@@ -147,10 +148,15 @@ class MaskedDiffWithXvec(torch.nn.Module):
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         
-        # Check for out-of-bounds token IDs
+        # Check for out-of-bounds token IDs (GPU-native)
         vocab_size = self.input_embedding.num_embeddings
-        if token.max() >= vocab_size or token.min() < 0:
-            logging.warning(f"S3Gen: Token IDs out of bounds: min={token.min().item()}, max={token.max().item()}, vocab_size={vocab_size}")
+        token_max = token.max()
+        token_min = token.min()
+        
+        if token_max >= vocab_size or token_min < 0:
+            # Only transfer to CPU for logging when actually needed
+            if logging.getLogger().isEnabledFor(logging.WARNING):
+                logging.warning(f"S3Gen: Token IDs out of bounds: min={token_min.item()}, max={token_max.item()}, vocab_size={vocab_size}")
         
         token = self.input_embedding(torch.clamp(token, min=0, max=vocab_size-1)) * mask
 
@@ -171,13 +177,13 @@ class MaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=n_timesteps,
             prompt_len=mel_len1,
             flow_cache=flow_cache
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
-        return feat.float(), flow_cache
+        return feat, flow_cache
 
 
 class CausalMaskedDiffWithXvec(torch.nn.Module):
@@ -194,6 +200,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         pre_lookahead_len: int = 3,
         encoder: torch.nn.Module = None,
         decoder: torch.nn.Module = None,
+        use_fp16: bool = False,
         decoder_conf: Dict = {
             'in_channels': 240,
             'out_channel': 80,
@@ -239,7 +246,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.pre_lookahead_len = pre_lookahead_len
 
         # FIXME: this was missing - just putting it in as false
-        self.fp16 = False
+        self.fp16 = use_fp16
 
     @torch.inference_mode()
     def inference(self,
@@ -250,7 +257,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat,
                   prompt_feat_len,
                   embedding,
-                  finalize):
+                  finalize,
+                  n_timesteps: int):
         embedding = embedding.to(self.spk_embed_affine_layer.weight.dtype)
         prompt_feat = prompt_feat.to(self.spk_embed_affine_layer.weight.dtype)
 
@@ -282,7 +290,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10
+            n_timesteps=n_timesteps,
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2

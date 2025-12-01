@@ -159,7 +159,7 @@ class ChatterboxTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        s3gen = S3Gen()
+        s3gen = S3Gen(use_fp16=False)
         s3gen.load_state_dict(
             load_file(ckpt_dir / "s3gen.safetensors"), strict=False
         )
@@ -302,6 +302,7 @@ class ChatterboxTTS:
                 wav, _ = self.s3gen.inference(
                     speech_tokens=speech_tokens,
                     ref_dict=self.conds.gen,
+                    n_timesteps=5,
                 )
                 end = time.time()
                 print(f"S3Gen inference time: {end - start:.2f} seconds")
@@ -361,6 +362,7 @@ class ChatterboxTTS:
         wav, _ = self.s3gen.inference(
             speech_tokens=clean_tokens,
             ref_dict=self.conds.gen,
+            n_timesteps=5,
         )
         # Pas de squeeze - garde dimension batch (1, samples)
         audio_chunk = wav.detach()

@@ -49,7 +49,9 @@ def mel_spectrogram(y, n_fft=1920, num_mels=80, sampling_rate=24000, hop_size=48
     min_val = torch.min(y)
     max_val = torch.max(y)
     if min_val < -1.0 or max_val > 1.0:
-        logger.warning(f"Audio values outside normalized range: min={min_val.item():.4f}, max={max_val.item():.4f}")
+        # Only transfer to CPU for logging when actually needed
+        if logger.isEnabledFor(logging.WARNING):
+            logger.warning(f"Audio values outside normalized range: min={min_val.item():.4f}, max={max_val.item():.4f}")
 
     global mel_basis, hann_window  # pylint: disable=global-statement,global-variable-not-assigned
     if f"{str(fmax)}_{str(y.device)}" not in mel_basis:

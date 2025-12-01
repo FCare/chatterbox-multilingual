@@ -122,9 +122,13 @@ if multilingual_model:
         
         # Debug: Try streaming with different parameters
         print("Starting multilingual streaming...")
-        for chunk_audio, metrics in multilingual_model.generate_stream(text, language_id="fr", stream_chunk_size=5, print_metrics=True):
+        # 5 = 160 ms playback -> 0.519ms TTf
+        for chunk_audio, metrics in multilingual_model.generate_stream(text, language_id="fr", stream_chunk_size=20, print_metrics=True):
             if chunk_audio is not None:
                 audio_chunks.append(chunk_audio)
+                if (chunk_count == 0):
+                    full_audio = torch.cat(audio_chunks, dim=-1)
+                    ta.save("test-local-4-streaming-first.wav", full_audio.detach().cpu(), multilingual_model.sr)
                 chunk_count += 1
                 # print(f"  📦 Chunk {chunk_count}: shape {chunk_audio.shape}")
             else:

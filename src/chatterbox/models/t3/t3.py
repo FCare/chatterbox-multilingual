@@ -753,17 +753,20 @@ class T3(nn.Module):
             torch.cuda.synchronize() # For benchmarking to have correct it/s
         stride_length = stride_length if "stride" in generate_token_backend else 1
 
-        # STREAMING SIMPLE: compteur de tokens générés
+        # STREAMING SIMPLE: compteur de tokens générés (GPU-native)
         def get_en_pos(vector):
             # Masque des tokens PAD
             pad_mask = vector[0] == PAD_TOKEN_ID
-            # Trouver position du premier PAD
-            first_pad_pos = torch.argmax(pad_mask.int()).item()
-            # Si pas de PAD trouvé, utiliser taille complète
-            if first_pad_pos == 0 and not pad_mask[0]:
-                return generated_ids.size(1)  # Aucun PAD
-            else:
-                return first_pad_pos  # Position du premier PAD
+            # Trouver position du premier PAD (GPU-native)
+            first_pad_pos = torch.argmax(pad_mask.int())
+            
+            # Si pas de PAD trouvé, utiliser taille complète (éviter .item())
+            # Utiliser torch.where pour éviter la branche conditionnelle
+            has_no_pad = (first_pad_pos == 0) & (~pad_mask[0])
+            result = torch.where(has_no_pad,
+                               torch.tensor(vector.size(1), device=vector.device),
+                               first_pad_pos)
+            return result.item()  # Une seule conversion à la fin
             
         start_yield_pos = 0
         end_yield_pos = get_en_pos(generated_ids)

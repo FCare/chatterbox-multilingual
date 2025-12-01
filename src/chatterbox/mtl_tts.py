@@ -193,7 +193,7 @@ class ChatterboxMultilingualTTS:
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
-        s3gen = S3Gen()
+        s3gen = S3Gen(use_fp16=False)
         s3gen.load_state_dict(
             torch.load(ckpt_dir / "s3gen.pt", weights_only=True)
         )
@@ -336,6 +336,7 @@ class ChatterboxMultilingualTTS:
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
+                n_timesteps=5,
             )
             # watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return wav.detach().cpu()
@@ -389,6 +390,7 @@ class ChatterboxMultilingualTTS:
         wav, _ = self.s3gen.inference(
             speech_tokens=clean_tokens,
             ref_dict=self.conds.gen,
+            n_timesteps=5,
         )
         # Pas de squeeze - garde dimension batch (1, samples)
         audio_chunk = wav.detach()

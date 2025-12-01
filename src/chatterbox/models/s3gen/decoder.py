@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat
+from typing import List
 
 from .utils.mask import add_optional_chunk_mask
 from .matcha.decoder import SinusoidalPosEmb, Block1D, ResnetBlock1D, Downsample1D, \
@@ -133,6 +134,10 @@ class ConditionalDecoder(nn.Module):
 
         # NOTE jrm: `static_chunk_size` is missing?
         self.static_chunk_size = 0
+        
+        # Cache for attention masks
+        self._attention_mask_cache = {}
+        self._cache_max_size = 32  # Limit cache size to prevent memory issues
 
         output_channel = in_channels
         for i in range(len(channels)):  # pylint: disable=consider-using-enumerate
@@ -230,6 +235,131 @@ class ConditionalDecoder(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
+    def _get_cached_attention_mask(
+        self,
+        x_shape: tuple,
+        mask: torch.Tensor,
+        dtype: torch.dtype,
+        static_chunk_size: int
+    ) -> torch.Tensor:
+        """Get cached attention mask or compute and cache it"""
+        # Create cache key based on relevant parameters (avoid CPU transfers)
+        # Use mask tensor pointer + shape instead of content hash
+        cache_key = (
+            x_shape,
+            mask.shape,
+            dtype,
+            static_chunk_size,
+            mask.data_ptr(),  # GPU tensor pointer - no CPU transfer
+            mask.device
+        )
+        
+        # Check cache first
+        if cache_key in self._attention_mask_cache:
+            cached_mask = self._attention_mask_cache[cache_key]
+            # Verify device compatibility
+            if cached_mask.device == mask.device:
+                return cached_mask
+            else:
+                # Remove stale cache entry if device changed
+                del self._attention_mask_cache[cache_key]
+        
+        # Compute mask if not cached
+        attn_mask = add_optional_chunk_mask(
+            torch.zeros(x_shape, dtype=dtype, device=mask.device),  # Dummy x for shape
+            mask.bool(), False, False, 0, static_chunk_size, -1
+        )
+        attn_mask = mask_to_bias(attn_mask == 1, dtype)
+        
+        # Cache management - remove oldest if cache is full
+        if len(self._attention_mask_cache) >= self._cache_max_size:
+            oldest_key = next(iter(self._attention_mask_cache))
+            del self._attention_mask_cache[oldest_key]
+        
+        # Store in cache
+        self._attention_mask_cache[cache_key] = attn_mask
+        return attn_mask
+
+    def clear_attention_mask_cache(self):
+        """Clear the attention mask cache - useful for memory cleanup"""
+        self._attention_mask_cache.clear()
+
+    def get_cache_stats(self) -> dict:
+        """Get cache statistics for debugging/monitoring"""
+        return {
+            'cache_size': len(self._attention_mask_cache),
+            'max_size': self._cache_max_size,
+            'cache_keys': list(self._attention_mask_cache.keys())
+        }
+
+    def fused_transformer_sequence(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        t: torch.Tensor,
+        transformer_blocks: List[nn.Module],
+        static_chunk_size: int
+    ) -> torch.Tensor:
+        """Fused transformer sequence: rearrange -> attention -> rearrange"""
+        # Single rearrange in
+        x = rearrange(x, "b c t -> b t c").contiguous()
+        
+        # Get cached attention mask
+        attn_mask = self._get_cached_attention_mask(
+            x.shape, mask, x.dtype, static_chunk_size
+        )
+        
+        # Apply all transformer blocks
+        for transformer_block in transformer_blocks:
+            x = transformer_block(
+                hidden_states=x,
+                attention_mask=attn_mask,
+                timestep=t,
+            )
+        
+        # Single rearrange out
+        return rearrange(x, "b t c -> b c t").contiguous()
+
+    def fused_mask_and_downsample(self, x: torch.Tensor, mask: torch.Tensor, downsample_layer) -> torch.Tensor:
+        """Fused masking and downsampling operation"""
+        masked_x = x * mask
+        return downsample_layer(masked_x)
+    
+    def fused_mask_and_upsample(self, x: torch.Tensor, mask: torch.Tensor, upsample_layer) -> torch.Tensor:
+        """Fused masking and upsampling operation"""
+        masked_x = x * mask
+        return upsample_layer(masked_x)
+
+    def fused_final_projection(self, x: torch.Tensor, final_mask: torch.Tensor, intermediate_mask: torch.Tensor) -> torch.Tensor:
+        """Fused final block + projection + final masking"""
+        # GPU-native mask comparison to avoid CPU transfer
+        # Check if masks are equivalent by comparing tensor properties first (fast)
+        if (final_mask.shape == intermediate_mask.shape and
+            final_mask.device == intermediate_mask.device and
+            final_mask.data_ptr() == intermediate_mask.data_ptr()):
+            # Same tensor reference - single masking at the end
+            x = self.final_block(x, intermediate_mask)
+            output = self.final_proj(x)
+            return output * final_mask
+        elif final_mask.shape == intermediate_mask.shape:
+            # Same shape, but need to check content - use GPU-native comparison
+            masks_equal = torch.allclose(final_mask, intermediate_mask, rtol=1e-7, atol=1e-7)
+            if masks_equal:
+                # Masks are equal - single masking at the end
+                x = self.final_block(x, intermediate_mask)
+                output = self.final_proj(x)
+                return output * final_mask
+            else:
+                # Different masks - need intermediate masking
+                x = self.final_block(x, intermediate_mask)
+                output = self.final_proj(x * intermediate_mask)
+                return output * final_mask
+        else:
+            # Different shapes - definitely need intermediate masking
+            x = self.final_block(x, intermediate_mask)
+            output = self.final_proj(x * intermediate_mask)
+            return output * final_mask
+
     def forward(self, x, mask, mu, t, spks=None, cond=None):
         """Forward pass of the UNet1DConditional model.
 
@@ -264,54 +394,24 @@ class ConditionalDecoder(nn.Module):
         for resnet, transformer_blocks, downsample in self.down_blocks:
             mask_down = masks[-1]
             x = resnet(x, mask_down, t)
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            # attn_mask = torch.matmul(mask_down.transpose(1, 2).contiguous(), mask_down)
-            attn_mask = add_optional_chunk_mask(x, mask_down.bool(), False, False, 0, self.static_chunk_size, -1)
-            attn_mask = mask_to_bias(attn_mask == 1, x.dtype)
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                )
-            x = rearrange(x, "b t c -> b c t").contiguous()
+            x = self.fused_transformer_sequence(x, mask_down, t, transformer_blocks, self.static_chunk_size)
             hiddens.append(x)  # Save hidden states for skip connections
-            x = downsample(x * mask_down)
+            x = self.fused_mask_and_downsample(x, mask_down, downsample)
             masks.append(mask_down[:, :, ::2])
         masks = masks[:-1]
         mask_mid = masks[-1]
 
         for resnet, transformer_blocks in self.mid_blocks:
             x = resnet(x, mask_mid, t)
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            # attn_mask = torch.matmul(mask_mid.transpose(1, 2).contiguous(), mask_mid)
-            attn_mask = add_optional_chunk_mask(x, mask_mid.bool(), False, False, 0, self.static_chunk_size, -1)
-            attn_mask = mask_to_bias(attn_mask == 1, x.dtype)
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                )
-            x = rearrange(x, "b t c -> b c t").contiguous()
+            x = self.fused_transformer_sequence(x, mask_mid, t, transformer_blocks, self.static_chunk_size)
 
         for resnet, transformer_blocks, upsample in self.up_blocks:
             mask_up = masks.pop()
             skip = hiddens.pop()
             x = pack([x[:, :, :skip.shape[-1]], skip], "b * t")[0]
             x = resnet(x, mask_up, t)
-            x = rearrange(x, "b c t -> b t c").contiguous()
-            # attn_mask = torch.matmul(mask_up.transpose(1, 2).contiguous(), mask_up)
-            attn_mask = add_optional_chunk_mask(x, mask_up.bool(), False, False, 0, self.static_chunk_size, -1)
-            attn_mask = mask_to_bias(attn_mask == 1, x.dtype)
-            for transformer_block in transformer_blocks:
-                x = transformer_block(
-                    hidden_states=x,
-                    attention_mask=attn_mask,
-                    timestep=t,
-                )
-            x = rearrange(x, "b t c -> b c t").contiguous()
-            x = upsample(x * mask_up)
-        x = self.final_block(x, mask_up)
-        output = self.final_proj(x * mask_up)
-        return output * mask
+            x = self.fused_transformer_sequence(x, mask_up, t, transformer_blocks, self.static_chunk_size)
+            x = self.fused_mask_and_upsample(x, mask_up, upsample)
+        
+        # Fused final operations with intelligent masking
+        return self.fused_final_projection(x, mask, mask_up)

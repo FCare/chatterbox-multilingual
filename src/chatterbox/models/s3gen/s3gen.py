@@ -50,7 +50,7 @@ class S3Token2Mel(torch.nn.Module):
 
     TODO: make these modules configurable?
     """
-    def __init__(self):
+    def __init__(self, use_fp16: bool = False):
         super().__init__()
         self.tokenizer = S3Tokenizer("speech_tokenizer_v2_25hz")
         self.mel_extractor = mel_spectrogram # TODO: make it a torch module?
@@ -94,7 +94,8 @@ class S3Token2Mel(torch.nn.Module):
 
         self.flow = CausalMaskedDiffWithXvec(
             encoder=encoder,
-            decoder=decoder
+            decoder=decoder,
+            use_fp16=use_fp16,
         )
 
         self.resamplers = {}
@@ -169,6 +170,7 @@ class S3Token2Mel(torch.nn.Module):
         ref_sr: Optional[int],
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
+        n_timesteps: int = 10,
         finalize: bool = False,
     ):
         """
@@ -209,6 +211,7 @@ class S3Token2Mel(torch.nn.Module):
             token=speech_tokens,
             token_len=speech_token_lens,
             finalize=finalize,
+            n_timesteps=n_timesteps,
             **ref_dict,
         )
         return output_mels
@@ -221,8 +224,8 @@ class S3Token2Wav(S3Token2Mel):
     TODO: make these modules configurable?
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, use_fp16: bool = False):
+        super().__init__(use_fp16=use_fp16)
 
         f0_predictor = ConvRNNF0Predictor()
         self.mel2wav = HiFTGenerator(
@@ -248,7 +251,7 @@ class S3Token2Wav(S3Token2Mel):
         ref_sr: Optional[int],
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
-        finalize: bool = False
+        finalize: bool = False,
     ):
         output_mels = super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
 
@@ -273,8 +276,9 @@ class S3Token2Wav(S3Token2Mel):
         # pre-computed ref embedding (prod API)
         ref_dict: Optional[dict] = None,
         finalize: bool = False,
+        n_timesteps: int = 10,
     ):
-        return super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        return super().forward(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, n_timesteps=n_timesteps)
 
     @torch.inference_mode()
     def hift_inference(self, speech_feat, cache_source: torch.Tensor = None):
@@ -294,8 +298,9 @@ class S3Token2Wav(S3Token2Mel):
         cache_source: torch.Tensor = None, # NOTE: this arg is for streaming, it can probably be removed here
         finalize: bool = True,
         no_trim: bool = False,
+        n_timesteps: int = 10,
     ):
-        output_mels = self.flow_inference(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize)
+        output_mels = self.flow_inference(speech_tokens, ref_wav=ref_wav, ref_sr=ref_sr, ref_dict=ref_dict, finalize=finalize, n_timesteps=n_timesteps)
         output_wavs, output_sources = self.hift_inference(output_mels, cache_source)
 
         # NOTE: ad-hoc method to reduce "spillover" from the reference clip.
