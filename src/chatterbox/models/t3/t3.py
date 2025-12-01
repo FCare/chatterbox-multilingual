@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
-from typing import Generator, Optional, Optional
+from typing import Generator, Optional, List
 import time
 
 logger = logging.getLogger(__name__)
@@ -612,7 +612,7 @@ class T3(nn.Module):
         skip_when_1=True,
         benchmark_t3=False,
         # streaming
-        stream_chunk_size=20,
+        stream_chunk_size: List[int] = [20,50,100]
     ):
         """
         Args:
@@ -773,6 +773,7 @@ class T3(nn.Module):
 
         # Buffer pour différer les checks EOS
         eos_check_buffer = []
+        chunk_id = 0
 
         for i in tqdm(range(max_new_tokens // stride_length), desc="Sampling", dynamic_ncols=True): 
             i_tensor = indices[i * stride_length]
@@ -788,10 +789,10 @@ class T3(nn.Module):
                     has_eos = combined_mask.any().item()  # Une seule sync pour plusieurs checks
                     if has_eos:
                         # Yield dernier chunk et stop
-                        while end_yield_pos - start_yield_pos >= stream_chunk_size:
-                            chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size].clone()
+                        while end_yield_pos - start_yield_pos >= stream_chunk_size[chunk_id]:
+                            chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size[chunk_id]].clone()
                             yield chunk
-                            start_yield_pos += stream_chunk_size
+                            start_yield_pos += stream_chunk_size[chunk_id]
                         if (start_yield_pos != end_yield_pos):
                             chunk = generated_ids[0, start_yield_pos:end_yield_pos].clone()
                             yield chunk
@@ -834,10 +835,12 @@ class T3(nn.Module):
                 generated_ids = outputs[2].clone()
                 end_yield_pos = get_en_pos(generated_ids)
 		        # Yield dernier chunk et stop
-                while end_yield_pos - start_yield_pos >= stream_chunk_size:
-                    chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size].clone()
+                while end_yield_pos - start_yield_pos >= stream_chunk_size[chunk_id]:
+                    chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size[chunk_id]].clone()
                     yield chunk
-                    start_yield_pos += stream_chunk_size
+                    start_yield_pos += stream_chunk_size[chunk_id]
+                    if (chunk_id < len(stream_chunk_size)-1):
+                        chunk_id = chunk_id + 1
             output_logits = output_logits.clone()
             if benchmark_t3:
                 torch.cuda.synchronize() # For benchmarking to have correct it/s
@@ -845,10 +848,10 @@ class T3(nn.Module):
                 print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
                 print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
                 
-        while end_yield_pos - start_yield_pos >= stream_chunk_size:
-            chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size].clone()
+        while end_yield_pos - start_yield_pos >= stream_chunk_size[chunk_id]:
+            chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size[chunk_id]].clone()
             yield chunk
-            start_yield_pos += stream_chunk_size
+            start_yield_pos += stream_chunk_size[chunk_id]
         if (start_yield_pos != end_yield_pos):
             chunk = generated_ids[0, start_yield_pos:end_yield_pos].clone()
             yield chunk

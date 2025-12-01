@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import time
-from typing import Generator, Tuple, Optional
+from typing import Generator, Tuple, List, Optional
 
 import librosa
 import numpy as np
@@ -410,7 +410,7 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
         # streaming parameters
-        stream_chunk_size: int = 25,  # Tokens per chunk 
+        stream_chunk_size: List[int] = [20,50,100],  # Tokens per chunk - Ramp up 
         context_window = 50,
         fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
         print_metrics: bool = True,
