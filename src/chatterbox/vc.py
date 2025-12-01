@@ -1,13 +1,15 @@
 from pathlib import Path
 
-import librosa
 import torch
+import torchaudio
+import gc
 import perth
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from .models.s3tokenizer import S3_SR
 from .models.s3gen import S3GEN_SR, S3Gen
+from .models.watermarker import OptimizedPerthImplicitWatermarker
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -26,7 +28,7 @@ class ChatterboxVC:
         self.sr = S3GEN_SR
         self.s3gen = s3gen
         self.device = device
-        self.watermarker = perth.PerthImplicitWatermarker()
+        self.watermarker = OptimizedPerthImplicitWatermarker(device=device)
         if ref_dict is None:
             self.ref_dict = None
         else:
@@ -75,8 +77,17 @@ class ChatterboxVC:
 
     def set_target_voice(self, wav_fpath):
         ## Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
-
+        s3gen_ref_wav, orig_sr = torchaudio.load(wav_fpath)
+        
+        # Resample if necessary
+        if orig_sr != S3GEN_SR:
+            s3gen_ref_wav = torchaudio.functional.resample(s3gen_ref_wav, orig_sr, S3GEN_SR)
+        
+        # Convert to mono if stereo and move to device
+        if s3gen_ref_wav.shape[0] > 1:
+            s3gen_ref_wav = s3gen_ref_wav.mean(dim=0, keepdim=True)
+        s3gen_ref_wav = s3gen_ref_wav.squeeze(0).to(self.device)
+        
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         self.ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
 
@@ -84,28 +95,31 @@ class ChatterboxVC:
         self,
         audio,
         target_voice_path=None,
+        n_timesteps = 5,
     ):
         if target_voice_path:
             self.set_target_voice(target_voice_path)
         else:
             assert self.ref_dict is not None, "Please `prepare_conditionals` first or specify `target_voice_path`"
-
         with torch.inference_mode():
-            audio_16, _ = librosa.load(audio, sr=S3_SR)
-            audio_16 = torch.from_numpy(audio_16).float().to(self.device)[None, ]
-
+            audio_16, orig_sr = torchaudio.load(audio)
+            
+            # Resample if necessary
+            if orig_sr != S3_SR:
+                audio_16 = torchaudio.functional.resample(audio_16, orig_sr, S3_SR)
+            
+            # Convert to mono if stereo and move to device
+            if audio_16.shape[0] > 1:
+                audio_16 = audio_16.mean(dim=0, keepdim=True)
+            audio_16 = audio_16.to(self.device).float()
             s3_tokens, _ = self.s3gen.tokenizer(audio_16)
             wav, _ = self.s3gen.inference(
                 speech_tokens=s3_tokens,
                 ref_dict=self.ref_dict,
+                n_timesteps=n_timesteps,
             )
-            wav_squeezed = wav.squeeze(0).detach()
-            # Transfert CPU uniquement si watermarking requis
-            if hasattr(self, 'watermarker') and self.watermarker:
-                wav_numpy = wav_squeezed.cpu().numpy()
-                watermarked_wav = self.watermarker.apply_watermark(wav_numpy, sample_rate=self.sr)
-                return torch.from_numpy(watermarked_wav).unsqueeze(0)
-            else:
-                return wav_squeezed.unsqueeze(0)
-        # Fallback si pas dans le try block
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+            watermarked_wav = self.watermarker.apply_watermark(wav.squeeze(0), sample_rate=self.sr).unsqueeze(0)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return watermarked_wav.detach().cpu()
+    

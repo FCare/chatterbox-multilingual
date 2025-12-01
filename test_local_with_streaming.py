@@ -341,7 +341,7 @@ if vc_model:
                 if audio_chunks:
                     # Concatenate all chunks
                     full_audio = torch.cat(audio_chunks, dim=-1)
-                    ta.save("test-local-10-vc-streaming.wav", full_audio.cpu(), vc_model.sr)
+                    ta.save("test-local-10-vc-streaming.wav", full_audio, vc_model.sr)
                     print(f"✅ Saved streaming VC to: test-local-10-vc-streaming.wav ({chunk_count} chunks)")
                 else:
                     print("❌ No audio chunks were generated during VC streaming")
@@ -352,7 +352,7 @@ if vc_model:
                     audio=SOURCE_AUDIO_PATH,
                     target_voice_path=TARGET_VOICE_PATH
                 )
-                ta.save("test-local-10-vc-fallback.wav", converted_wav, vc_model.sr)
+                ta.save("test-local-10-vc-fallback.wav", converted_wav.cpu(), vc_model.sr)
                 print("✅ Saved fallback VC to: test-local-10-vc-fallback.wav")
         else:
             print(f"⚠️  Audio files not found:")
