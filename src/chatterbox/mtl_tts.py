@@ -7,7 +7,7 @@ import os
 import librosa
 import numpy as np
 import torch
-import perth
+import gc
 import torch.nn.functional as F
 from safetensors.torch import load_file as load_safetensors
 from huggingface_hub import snapshot_download
@@ -343,6 +343,8 @@ class ChatterboxMultilingualTTS:
                 n_timesteps=n_timesteps,
             )
             watermarked_wav = self.watermarker.apply_watermark(wav.squeeze(0), sample_rate=self.sr).unsqueeze(0)
+        gc.collect()
+        torch.cuda.empty_cache()
         return watermarked_wav.detach().cpu()
 
     def _process_token_buffer(
@@ -516,14 +518,14 @@ class ChatterboxMultilingualTTS:
                 # Extract only the conditional batch.
 
                 # Process each chunk immediately
-                audio_tensor, audio_duration, success = self._process_token_buffer(
+                wav, audio_duration, success = self._process_token_buffer(
                     [token_chunk], all_tokens_processed, context_window, 
                     start_time, metrics, print_metrics, fade_duration, n_timesteps
                 )
                 
                 if success:
                     total_audio_length += audio_duration
-                    yield audio_tensor, metrics
+                    yield wav.detach().cpu(), metrics
                 
                 # Update all_tokens_processed with the new tokens
                 if len(all_tokens_processed) == 0:
@@ -541,3 +543,5 @@ class ChatterboxMultilingualTTS:
                     print(f"Total audio duration: {metrics.total_audio_duration:.3f}s")
                     print(f"RTF (Real-Time Factor): {metrics.rtf:.3f}")
                     print(f"Total chunks yielded: {metrics.chunk_count}")
+        gc.collect()
+        torch.cuda.empty_cache()
