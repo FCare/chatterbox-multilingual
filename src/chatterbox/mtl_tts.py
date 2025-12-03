@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 from typing import Generator, Tuple, Optional, List
 import os
+from collections import OrderedDict
 
 import librosa
 import numpy as np
@@ -165,6 +166,10 @@ class ChatterboxMultilingualTTS:
         self.device = device
         self.conds = conds
         self.watermarker = OptimizedPerthImplicitWatermarker(device=device)
+        
+        # Cache system for conditionals
+        self._conditionals_cache = OrderedDict()  # Cache LRU
+        self._cache_max_size = 50  # Limite du nombre d'entrées dans le cache
 
     @classmethod
     def get_supported_languages(cls):
@@ -223,7 +228,47 @@ class ChatterboxMultilingualTTS:
         )
         return cls.from_local(ckpt_dir, device)
     
+    def _get_cache_key(self, wav_fpath, exaggeration):
+        """Génère une clé unique pour le cache basée sur le path et l'exaggeration."""
+        # Convertir le path en path absolu pour éviter les problèmes de paths relatifs
+        abs_path = Path(wav_fpath).resolve()
+        
+        # Créer une clé unique combinant le path et l'exaggeration
+        cache_key = f"{abs_path}:{exaggeration}"
+        
+        # Optionnel: ajouter la taille du fichier et la date de modification
+        # pour détecter si le fichier a changé
+        try:
+            stat = abs_path.stat()
+            cache_key += f":{stat.st_size}:{stat.st_mtime}"
+        except OSError:
+            pass
+            
+        return cache_key
+    
+    def _manage_cache_size(self):
+        """Gère la taille du cache en supprimant les entrées les plus anciennes."""
+        while len(self._conditionals_cache) >= self._cache_max_size:
+            # Supprime l'entrée la plus ancienne (FIFO)
+            oldest_key = next(iter(self._conditionals_cache))
+            del self._conditionals_cache[oldest_key]
+    
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+        # Générer la clé de cache
+        cache_key = self._get_cache_key(wav_fpath, exaggeration)
+        
+        # Vérifier si on a déjà calculé ces conditionals
+        if cache_key in self._conditionals_cache:
+            # Cache hit - récupérer depuis le cache
+            self.conds = self._conditionals_cache[cache_key]
+            # Déplacer vers la fin pour LRU
+            self._conditionals_cache.move_to_end(cache_key)
+            print(f"Cache hit for {wav_fpath} with exaggeration={exaggeration}")
+            return
+            
+        # Cache miss - calculer les conditionals
+        print(f"Cache miss for {wav_fpath} with exaggeration={exaggeration}")
+        
         ## Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
@@ -251,7 +296,12 @@ class ChatterboxMultilingualTTS:
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1, dtype=ve_embed.dtype),
         ).to(device=self.device)
+        
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        
+        # Ajouter au cache
+        self._manage_cache_size()  # S'assurer qu'on ne dépasse pas la limite
+        self._conditionals_cache[cache_key] = self.conds
 
     def generate(
         self,
@@ -546,3 +596,15 @@ class ChatterboxMultilingualTTS:
                     print(f"Total chunks yielded: {metrics.chunk_count}")
         gc.collect()
         torch.cuda.empty_cache()
+
+    def clear_conditionals_cache(self):
+        """Vide le cache des conditionals."""
+        self._conditionals_cache.clear()
+        
+    def get_cache_info(self):
+        """Retourne des informations sur l'état du cache."""
+        return {
+            'size': len(self._conditionals_cache),
+            'max_size': self._cache_max_size,
+            'keys': list(self._conditionals_cache.keys())
+        }
