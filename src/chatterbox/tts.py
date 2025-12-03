@@ -200,6 +200,9 @@ class ChatterboxTTS:
             local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
 
         return cls.from_local(Path(local_path).parent, device)
+    
+    def prepare_conditionals_cache(self, wav_fpath, exaggeration=0.5):
+        return
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav
