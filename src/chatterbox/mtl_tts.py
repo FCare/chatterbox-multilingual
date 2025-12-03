@@ -169,7 +169,7 @@ class ChatterboxMultilingualTTS:
         
         # Cache system for conditionals
         self._conditionals_cache = OrderedDict()  # Cache LRU
-        self._cache_max_size = 50  # Limite du nombre d'entrées dans le cache
+        self._cache_max_size = 500  # Limite du nombre d'entrées dans le cache
 
     @classmethod
     def get_supported_languages(cls):
