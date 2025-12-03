@@ -780,35 +780,22 @@ class T3(nn.Module):
             i_tensor = indices[i * stride_length]
             # Check for EOS token.
             if i * stride_length > length_guesstimate and i % (20 // stride_length) == 0:
-                # Buffer le check au lieu de sync immédiatement
-                eos_mask = (generated_ids == stop_token_tensor)
-                eos_check_buffer.append(eos_mask)
-                
-                # Ne check que si buffer trop grand (évite sync fréquentes)
-                if len(eos_check_buffer) > 5:  # Check tous les 100 steps au lieu de 20
-                    combined_mask = torch.stack(eos_check_buffer).any(dim=0)
-                    has_eos = combined_mask.any().item()  # Une seule sync pour plusieurs checks
-                    if has_eos:
-                        # Yield dernier chunk et stop
-                        while end_yield_pos - start_yield_pos >= stream_chunk_size[chunk_id]:
-                            chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size[chunk_id]].clone()
-                            yield chunk
-                            start_yield_pos += stream_chunk_size[chunk_id]
-                        if (start_yield_pos != end_yield_pos):
-                            chunk = generated_ids[0, start_yield_pos:end_yield_pos].clone()
-                            yield chunk
-                        if benchmark_t3:
-                            # torch.cuda.synchronize() # Only if needed
-                            print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
-                        break
-                    eos_check_buffer.clear()
-                    if benchmark_t3:
-                        torch.cuda.synchronize() # For benchmarking to have correct it/s
-                        print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
-                        print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
-                        # it/s
-                        print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
-                    break
+                if (generated_ids == stop_token_tensor).any():
+                    # Yield dernier chunk et stop
+                    while end_yield_pos - start_yield_pos >= stream_chunk_size[chunk_id]:
+                        chunk = generated_ids[0, start_yield_pos:start_yield_pos + stream_chunk_size[chunk_id]].clone()
+                        yield chunk
+                        start_yield_pos += stream_chunk_size[chunk_id]
+                    if (start_yield_pos != end_yield_pos):
+                        chunk = generated_ids[0, start_yield_pos:end_yield_pos].clone()
+                        yield chunk
+                if benchmark_t3:
+                    torch.cuda.synchronize() # For benchmarking to have correct it/s
+                    print(f"Stopping at {(i + 1) * stride_length} because EOS token was generated")
+                    print(f"Generated {(i + 1) * stride_length} tokens in {time.time() - start:.2f} seconds")
+                    # it/s
+                    print(f"{(i + 1) * stride_length / (time.time() - start):.2f} it/s")
+                break
             # print(kv_cache.get_seq_length().unsqueeze(0))
             torch.compiler.cudagraph_mark_step_begin()
             bucket_size = 500
