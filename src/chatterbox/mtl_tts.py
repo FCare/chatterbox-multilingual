@@ -408,6 +408,7 @@ class ChatterboxMultilingualTTS:
         print_metrics,
         fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
         n_timesteps = 5,
+        last_chunk_end_value=None,  # Valeur de fin du chunk précédent pour lissage
     ):
 
         # Combine buffered chunks of tokens
@@ -462,16 +463,40 @@ class ChatterboxMultilingualTTS:
         if audio_chunk.shape[-1] == 0:
             return None, 0.0, False
 
-        # Apply a short linear fade-in on the new chunk to smooth boundaries
+        # Transition lisse depuis la fin du chunk précédent pour éliminer les craquements
         fade_samples = int(fade_duration * self.sr)
-        if fade_samples > 0:
+        last_chunk_end = None  # Valeur de fin de ce chunk pour le prochain
+        
+        if fade_samples > 0 and last_chunk_end_value is not None and metrics.chunk_count > 0:
             if fade_samples > audio_chunk.shape[-1]:
                 fade_samples = audio_chunk.shape[-1]
-            # GPU-native fade-in avec torch.linspace
+            
+            # Valeur naturelle du début de ce chunk (avant modification)
+            chunk_start_value = audio_chunk[..., 0].clone()
+            
+            # Créer transition lisse de last_chunk_end_value vers chunk_start_value
+            fade_curve = torch.linspace(
+                last_chunk_end_value,
+                chunk_start_value,
+                fade_samples,
+                dtype=audio_chunk.dtype,
+                device=audio_chunk.device
+            )
+            
+            # Appliquer la transition au début du chunk
+            audio_chunk[..., :fade_samples] = fade_curve
+        elif fade_samples > 0 and metrics.chunk_count == 0:
+            # Pour le premier chunk, garder un fade-in classique
+            if fade_samples > audio_chunk.shape[-1]:
+                fade_samples = audio_chunk.shape[-1]
             fade_in = torch.linspace(0.0, 1.0, fade_samples,
                                    dtype=audio_chunk.dtype,
                                    device=audio_chunk.device)
             audio_chunk[..., :fade_samples] *= fade_in
+
+        # Sauvegarder la dernière valeur pour le prochain chunk
+        if audio_chunk.shape[-1] > 0:
+            last_chunk_end = audio_chunk[..., -1].clone()
 
         # Compute audio duration and watermark
         audio_duration = audio_chunk.shape[-1] / self.sr
@@ -484,7 +509,7 @@ class ChatterboxMultilingualTTS:
                 print(f"Latency to first chunk: {metrics.latency_to_first_chunk:.3f}s")
 
         metrics.chunk_count += 1
-        return watermarked_chunk, audio_duration, True
+        return watermarked_chunk, audio_duration, True, last_chunk_end
     
     def generate_stream(
         self,
@@ -551,6 +576,7 @@ class ChatterboxMultilingualTTS:
 
         total_audio_length = 0.0
         all_tokens_processed = []  # Keep track of all tokens processed so far
+        last_chunk_end_value = None  # Pour le lissage entre chunks
 
         with torch.inference_mode():
             for token_chunk in self.t3.inference_stream(
@@ -568,15 +594,18 @@ class ChatterboxMultilingualTTS:
             ):
                 # Extract only the conditional batch.
 
-                # Process each chunk immediately
-                wav, audio_duration, success = self._process_token_buffer(
-                    [token_chunk], all_tokens_processed, context_window, 
-                    start_time, metrics, print_metrics, fade_duration, n_timesteps
+                # Process each chunk immediately avec lissage
+                wav, audio_duration, success, chunk_end_value = self._process_token_buffer(
+                    [token_chunk], all_tokens_processed, context_window,
+                    start_time, metrics, print_metrics, fade_duration, n_timesteps,
+                    last_chunk_end_value
                 )
                 
                 if success:
                     total_audio_length += audio_duration
                     yield wav.detach().cpu(), metrics
+                    # Mettre à jour la valeur de fin pour le prochain chunk
+                    last_chunk_end_value = chunk_end_value
                 
                 # Update all_tokens_processed with the new tokens
                 if len(all_tokens_processed) == 0:
