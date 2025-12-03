@@ -144,6 +144,27 @@ class Conditionals:
         kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
         return cls(T3Cond(**kwargs['t3']), kwargs['gen'])
 
+    def clone(self):
+        """Crée une copie indépendante des conditionals en clonant tous les tenseurs."""
+        # Cloner T3Cond
+        cloned_t3 = T3Cond(
+            speaker_emb=self.t3.speaker_emb.clone() if self.t3.speaker_emb is not None else None,
+            clap_emb=self.t3.clap_emb.clone() if self.t3.clap_emb is not None else None,
+            cond_prompt_speech_tokens=self.t3.cond_prompt_speech_tokens.clone() if self.t3.cond_prompt_speech_tokens is not None else None,
+            cond_prompt_speech_emb=self.t3.cond_prompt_speech_emb.clone() if self.t3.cond_prompt_speech_emb is not None else None,
+            emotion_adv=self.t3.emotion_adv.clone() if self.t3.emotion_adv is not None else None,
+        )
+        
+        # Cloner le dictionnaire gen
+        cloned_gen = {}
+        for k, v in self.gen.items():
+            if torch.is_tensor(v):
+                cloned_gen[k] = v.clone()
+            else:
+                cloned_gen[k] = v  # Pour les non-tenseurs (ex: entiers, etc.)
+        
+        return Conditionals(cloned_t3, cloned_gen)
+
 
 class ChatterboxMultilingualTTS:
     ENC_COND_LEN = 6 * S3_SR
@@ -259,8 +280,10 @@ class ChatterboxMultilingualTTS:
         
         # Vérifier si on a déjà calculé ces conditionals
         if cache_key in self._conditionals_cache:
-            # Cache hit - récupérer depuis le cache
-            self.conds = self._conditionals_cache[cache_key]
+            # Cache hit - récupérer depuis le cache CPU et remettre sur GPU
+            cached_conds = self._conditionals_cache[cache_key]
+            # Cloner pour éviter de modifier le cache
+            self.conds = cached_conds.clone().to(self.device)
             # Déplacer vers la fin pour LRU
             self._conditionals_cache.move_to_end(cache_key)
             print(f"Cache hit for {wav_fpath} with exaggeration={exaggeration}")
@@ -299,9 +322,10 @@ class ChatterboxMultilingualTTS:
         
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
         
-        # Ajouter au cache
+        # Ajouter au cache en stockant une copie en CPU pour économiser la VRAM
         self._manage_cache_size()  # S'assurer qu'on ne dépasse pas la limite
-        self._conditionals_cache[cache_key] = self.conds
+        # Cloner avant de stocker en CPU
+        self._conditionals_cache[cache_key] = self.conds.clone().to('cpu')
 
     def generate(
         self,
