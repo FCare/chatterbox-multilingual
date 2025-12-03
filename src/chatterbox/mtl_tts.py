@@ -430,7 +430,7 @@ class ChatterboxMultilingualTTS:
         # Drop any invalid tokens and move to the correct device
         clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
         if len(clean_tokens) == 0:
-            return None, 0.0, False
+            return None, 0.0, False, None
         def drop_bad_tokens(tokens):
             # Use torch.where instead of boolean indexing to avoid sync
             mask = tokens < 6561
@@ -444,7 +444,7 @@ class ChatterboxMultilingualTTS:
 
         clean_tokens = drop_bad_tokens(clean_tokens)
         if len(clean_tokens) == 0:
-            return None, 0.0, False
+            return None, 0.0, False, None
 
 
         # Run S3Gen inference to get a waveform (1 × T)
@@ -461,7 +461,7 @@ class ChatterboxMultilingualTTS:
             audio_chunk = audio_chunk[..., skip_samples:]
 
         if audio_chunk.shape[-1] == 0:
-            return None, 0.0, False
+            return None, 0.0, False, None
 
         # Transition lisse depuis la fin du chunk précédent pour éliminer les craquements
         fade_samples = int(fade_duration * self.sr)
@@ -472,11 +472,11 @@ class ChatterboxMultilingualTTS:
                 fade_samples = audio_chunk.shape[-1]
             
             # Valeur naturelle du début de ce chunk (avant modification)
-            chunk_start_value = audio_chunk[..., 0].clone()
+            chunk_start_value = audio_chunk[..., 0].item()
             
             # Créer transition lisse de last_chunk_end_value vers chunk_start_value
             fade_curve = torch.linspace(
-                last_chunk_end_value,
+                last_chunk_end_value.item() if torch.is_tensor(last_chunk_end_value) else last_chunk_end_value,
                 chunk_start_value,
                 fade_samples,
                 dtype=audio_chunk.dtype,
@@ -496,7 +496,7 @@ class ChatterboxMultilingualTTS:
 
         # Sauvegarder la dernière valeur pour le prochain chunk
         if audio_chunk.shape[-1] > 0:
-            last_chunk_end = audio_chunk[..., -1].clone()
+            last_chunk_end = audio_chunk[..., -1].item()
 
         # Compute audio duration and watermark
         audio_duration = audio_chunk.shape[-1] / self.sr
