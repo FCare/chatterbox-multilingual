@@ -495,7 +495,7 @@ class ChatterboxMultilingualTTS:
         cfg_weight=0.5,
         temperature=0.8,
         # streaming parameters
-        stream_chunk_size: List[int] = [20,50,100],  # Tokens per chunk - Ramp up 
+        stream_chunk_size: List[int] = [100],  # Tokens per chunk - Ramp up 
         context_window = 50,
         fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
         print_metrics: bool = True,
